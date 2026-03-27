@@ -21,6 +21,7 @@ import android.annotation.UiThread
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.ColorDrawable
 import android.hardware.biometrics.BiometricRequestConstants.REASON_AUTH_KEYGUARD
 import android.hardware.biometrics.BiometricRequestConstants.RequestReason
 import android.hardware.display.DisplayManager
@@ -28,6 +29,7 @@ import android.util.Log
 import android.view.Display
 import android.view.View
 import android.view.WindowManager
+import com.android.internal.graphics.ColorUtils
 import androidx.core.view.isVisible
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
@@ -52,7 +54,7 @@ class UdfpsHelper(
     @RequestReason val requestReason: Int,
     private val brightnessMirrorShowingInteractor: BrightnessMirrorShowingInteractor,
     private var view: View = View(context).apply {
-        setBackgroundColor(Color.BLACK)
+        background = ColorDrawable(Color.BLACK)
         visibility = View.GONE
     }
 ) {
@@ -76,7 +78,7 @@ class UdfpsHelper(
     private val dimLayoutParams = WindowManager.LayoutParams(
         WindowManager.LayoutParams.TYPE_NAVIGATION_BAR_PANEL,
         0 /* flags are set in computeLayoutParams() */,
-        PixelFormat.TRANSPARENT
+        PixelFormat.TRANSLUCENT
     ).apply {
         title = "Dim Layer for UDFPS"
         fitInsetsTypes = 0
@@ -94,13 +96,21 @@ class UdfpsHelper(
     private val alphaAnimator = ValueAnimator().apply {
         duration = 800L
         addUpdateListener { animator ->
-            view.alpha = animator.animatedValue as Float
-            dimLayoutParams.alpha = animator.animatedValue as Float
+            applyAlphaToBackground(animator.animatedValue as Float)
             try {
                 windowManager.updateViewLayout(view, dimLayoutParams)
             } catch (e: IllegalArgumentException) {
                 Log.e(TAG, "View not attached to WindowManager", e)
             }
+        }
+    }
+
+    private fun applyAlphaToBackground(alpha: Float) {
+        val a = (alpha.coerceIn(0f, 1f) * 255f).toInt().coerceIn(0, 255)
+        val color = ColorUtils.setAlphaComponent(Color.BLACK, a)
+        when (val bg = view.background) {
+            is ColorDrawable -> bg.color = color
+            else -> view.setBackgroundColor(color)
         }
     }
 
@@ -157,10 +167,9 @@ class UdfpsHelper(
 
         Log.i(TAG, "Adjusted Brightness: $adjustedBrightness, Alpha: $targetAlpha")
 
-        alphaAnimator.setFloatValues(view.alpha, targetAlpha)
-        // Set the dim for both the view and the layout
-        view.alpha = targetAlpha
-        dimLayoutParams.alpha = targetAlpha
+        val currentAlpha = ((view.background as? ColorDrawable)?.alpha ?: 0) / 255.0f
+        alphaAnimator.setFloatValues(currentAlpha, targetAlpha)
+        applyAlphaToBackground(targetAlpha)
     }
 
     fun addDimLayer() {

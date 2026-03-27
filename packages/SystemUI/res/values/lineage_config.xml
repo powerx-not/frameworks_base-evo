@@ -31,6 +31,7 @@
            • Last entry  = <maxBrightness,minAlpha>.
     -->
     <string-array name="config_udfpsDimmingBrightnessAlphaArray" translatable="false">
+          <!-- Example:
           <item>3,238</item>
           <item>4,236</item>
           <item>6,236</item>
@@ -55,6 +56,7 @@
           <item>1817,53</item>
           <item>2047,46</item>
           <item>4095,0</item>
+          -->
     </string-array>
 
     <!-- Whether to enable MediaTek-specific optical dimming for UDFPS -->
