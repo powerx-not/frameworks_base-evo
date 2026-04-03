@@ -1,0 +1,4 @@
+service truebackupd /system_ext/bin/truebackupd
+    class main
+    user root
+    group root

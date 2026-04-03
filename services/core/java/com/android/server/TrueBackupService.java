@@ -1,13 +1,33 @@
 package com.android.server;
 
 import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageInstaller;
+import android.content.pm.PackageManager;
+import android.os.IBinder;
 import android.os.ITrueBackupService;
 import android.os.RemoteException;
+import android.os.ServiceManager;
 import android.util.Slog;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
 
 /**
  * Service to handle TrueBackup operations with system privileges.
@@ -18,6 +38,38 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final String TAG = "TrueBackupService";
     private final Context mContext;
     private boolean mInProgress = false;
+
+    private static final String TRUEBACKUPD_SERVICE = "truebackupd";
+    private static final int TRUEBACKUPD_TOKEN = 0x5452424b; // 'TRBK'
+    private static final int TRUEBACKUPD_ZIP_DIR = IBinder.FIRST_CALL_TRANSACTION;
+    private static final int TRUEBACKUPD_UNZIP_TO_DIR = IBinder.FIRST_CALL_TRANSACTION + 1;
+    private static final int TRUEBACKUPD_MKDIRS = IBinder.FIRST_CALL_TRANSACTION + 2;
+    private static final int TRUEBACKUPD_ZIP_SINGLE_FILE = IBinder.FIRST_CALL_TRANSACTION + 3;
+    private static final int TRUEBACKUPD_ZIP_MULTI_FILE = IBinder.FIRST_CALL_TRANSACTION + 4;
+    private static final int TRUEBACKUPD_WRITE_FILE = IBinder.FIRST_CALL_TRANSACTION + 5;
+
+    private static final String FILE_CONFIG = "package_restore_config.json";
+
+    private static final String DIR_APK = "apk";
+    private static final String DIR_INT_DATA = "int_data";
+    private static final String DIR_EXT_DATA = "ext_data";
+    private static final String DIR_ADDL_DATA = "addl_data";
+
+    private static final String ZIP_APK = "apk.zip";
+    private static final String ZIP_USER = "user.zip";
+    private static final String ZIP_USER_DE = "user_de.zip";
+    private static final String ZIP_DATA = "data.zip";
+    private static final String ZIP_OBB = "obb.zip";
+    private static final String ZIP_MEDIA = "media.zip";
+
+    private static final String ZIP_USER_CE_LEGACY = "user_ce.zip";
+    private static final String ZIP_EXT_DATA_LEGACY = "external_data.zip";
+
+    private static final String CE_BASE = "/data_mirror/data_ce/null/0/";
+    private static final String DE_BASE = "/data_mirror/data_de/null/0/";
+    private static final String EXT_DATA_BASE = "/data/media/0/Android/data/";
+    private static final String OBB_BASE = "/data/media/0/Android/obb/";
+    private static final String MEDIA_BASE = "/data/media/0/Android/media/";
 
     public TrueBackupService(Context context) {
         mContext = context;
@@ -36,19 +88,38 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         new Thread(() -> {
             try {
                 Slog.d(TAG, "Starting backup for " + packageName + " to " + destPath);
-                File dataDir = new File("/data/data/" + packageName);
-                File destFile = new File(destPath, packageName + ".data");
-                
-                if (!dataDir.exists()) {
-                    Slog.e(TAG, "Data directory not found for " + packageName);
+                File pkgDir = resolvePackageBackupDir(destPath, packageName);
+                if (!ensureDirs(pkgDir)) {
+                    Slog.e(TAG, "Could not create backup directory: " + pkgDir);
                     return;
                 }
 
-                // In a real implementation, we would use tar or a zip library.
-                // For this demonstration, we'll simulate a recursive copy or 
-                // perform a basic directory walk to show the capability.
-                recursiveCopy(dataDir, new File(destPath, packageName + "_data"));
-                
+                BackupParts parts = new BackupParts();
+
+                // APK
+                File apkZip = new File(new File(pkgDir, DIR_APK), ZIP_APK);
+                parts.apk = zipApk(packageName, apkZip);
+
+                // Internal data
+                File ceZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER);
+                parts.userCe = zipDirIfExists(new File(CE_BASE, packageName), ceZip);
+
+                File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
+                parts.userDe = zipDirIfExists(new File(DE_BASE, packageName), deZip);
+
+                // External data
+                File extZip = new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA);
+                parts.extData = zipDirIfExists(new File(EXT_DATA_BASE, packageName), extZip);
+
+                // Additional
+                File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
+                parts.obb = zipDirIfExists(new File(OBB_BASE, packageName), obbZip);
+
+                File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
+                parts.media = zipDirIfExists(new File(MEDIA_BASE, packageName), mediaZip);
+
+                writeConfig(new File(pkgDir, FILE_CONFIG), packageName, parts);
+
                 Slog.i(TAG, "Backup finished successfully for " + packageName);
             } catch (Exception e) {
                 Slog.e(TAG, "Backup failed for " + packageName, e);
@@ -72,18 +143,18 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         new Thread(() -> {
             try {
                 Slog.d(TAG, "Starting restore for " + packageName + " from " + sourcePath);
-                File sourceDir = new File(sourcePath, packageName + "_data");
-                File dataDir = new File("/data/data/" + packageName);
+                File pkgDir = resolvePackageBackupDir(sourcePath, packageName);
+                File legacyDir = new File(sourcePath, packageName + "_data");
 
-                if (!sourceDir.exists()) {
+                if (pkgDir.exists()) {
+                    restoreFromPackageDir(packageName, pkgDir);
+                } else if (legacyDir.exists()) {
+                    File dataDir = new File("/data/data/" + packageName);
+                    recursiveCopy(legacyDir, dataDir);
+                } else {
                     Slog.e(TAG, "Source data not found at " + sourcePath);
                     return;
                 }
-
-                // Restore logic: copy back and fix permissions if necessary.
-                // system_server can write to /data/data but needs to ensure
-                // the app's UID is preserved for the files.
-                recursiveCopy(sourceDir, dataDir);
                 
                 Slog.i(TAG, "Restore finished successfully for " + packageName);
             } catch (Exception e) {
@@ -101,8 +172,748 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         return mInProgress;
     }
 
+    @Override
+    public String[] listBackedUpApps(String basePath) {
+        checkPermission();
+        File appsDir = resolveAppsDir(basePath);
+        if (appsDir == null) return new String[0];
+
+        File[] pkgDirs = appsDir.listFiles();
+        if (pkgDirs == null) return new String[0];
+
+        ArrayList<String> out = new ArrayList<>();
+        for (File pkgDir : pkgDirs) {
+            if (pkgDir == null || !pkgDir.isDirectory()) continue;
+
+            File config = new File(pkgDir, FILE_CONFIG);
+            if (!config.exists() || !config.isFile()) continue;
+
+            String pkg = pkgDir.getName();
+            String label = "";
+            try {
+                String json = new String(readFully(config), StandardCharsets.UTF_8);
+                JSONObject root = new JSONObject(json);
+                JSONObject pkgInfo = root.optJSONObject("packageInfo");
+                if (pkgInfo != null) {
+                    String pkgFromJson = pkgInfo.optString("packageName", null);
+                    if (pkgFromJson != null && !pkgFromJson.isEmpty()) {
+                        pkg = pkgFromJson;
+                    }
+                    String lbl = pkgInfo.optString("appLabel", null);
+                    if (lbl != null) {
+                        label = lbl;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+
+            out.add(pkg + "|" + label);
+        }
+
+        return out.toArray(new String[0]);
+    }
+
     private void checkPermission() {
         mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP, "TrueBackup");
+    }
+
+    private static File resolveAppsDir(String basePath) {
+        if (basePath == null) return null;
+        File base = new File(basePath);
+
+        if (base.isDirectory() && "apps".equals(base.getName())) {
+            return base;
+        }
+
+        if (base.isDirectory() && "backup".equals(base.getName())) {
+            File candidate = new File(base, "apps");
+            if (candidate.isDirectory()) return candidate;
+        }
+
+        File candidate1 = new File(new File(base, "backup"), "apps");
+        if (candidate1.isDirectory()) return candidate1;
+
+        File candidate2 = new File(base, "apps");
+        if (candidate2.isDirectory()) return candidate2;
+
+        return null;
+    }
+
+    private static byte[] readFully(File f) throws IOException {
+        try (FileInputStream in = new FileInputStream(f)) {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[16 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            return out.toByteArray();
+        }
+    }
+
+    private boolean isPackageInstalled(String packageName) {
+        try {
+            mContext.getPackageManager().getPackageInfo(packageName, 0);
+            return true;
+        } catch (PackageManager.NameNotFoundException e) {
+            return false;
+        }
+    }
+
+    private static final class LocalIntentReceiver {
+        private final LinkedBlockingQueue<Intent> mResult = new LinkedBlockingQueue<>();
+
+        private final android.content.IIntentSender.Stub mLocalSender = new android.content.IIntentSender.Stub() {
+            @Override
+            public void send(int code, Intent intent, String resolvedType,
+                    android.os.IBinder whitelistToken,
+                    android.content.IIntentReceiver finishedReceiver,
+                    String requiredPermission, android.os.Bundle options) {
+                mResult.offer(intent);
+            }
+        };
+
+        android.content.IntentSender getIntentSender() {
+            return new android.content.IntentSender((android.content.IIntentSender) mLocalSender);
+        }
+
+        Intent getResult(long timeoutMs) throws InterruptedException {
+            return mResult.poll(timeoutMs, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void installApksFromBackupIfNeeded(String packageName, File pkgDir) throws IOException {
+        if (isPackageInstalled(packageName)) {
+            return;
+        }
+
+        File apkZip = new File(new File(pkgDir, DIR_APK), ZIP_APK);
+        if (!apkZip.exists()) {
+            throw new IOException("App not installed and apk.zip missing: " + apkZip);
+        }
+
+        // Install via PackageInstaller session (supports splits).
+        PackageManager pm = mContext.getPackageManager();
+        PackageInstaller installer = pm.getPackageInstaller();
+        PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
+                PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+        params.setAppPackageName(packageName);
+
+        int sessionId = installer.createSession(params);
+        PackageInstaller.Session session = installer.openSession(sessionId);
+        try {
+            byte[] buffer = new byte[128 * 1024];
+
+            boolean wroteAny = false;
+            try (ZipInputStream zis = new ZipInputStream(new FileInputStream(apkZip))) {
+                ZipEntry entry;
+                while ((entry = zis.getNextEntry()) != null) {
+                    if (entry.isDirectory()) continue;
+                    String name = entry.getName();
+                    if (name == null || !name.endsWith(".apk")) continue;
+
+                    String apkName = new File(name).getName();
+                    if (apkName.isEmpty()) continue;
+
+                    try (java.io.OutputStream out = session.openWrite(apkName, 0, entry.getSize())) {
+                        int n;
+                        while ((n = zis.read(buffer)) > 0) {
+                            out.write(buffer, 0, n);
+                        }
+                        session.fsync(out);
+                    }
+                    wroteAny = true;
+                }
+            }
+
+            if (!wroteAny) {
+                throw new IOException("No APK entries found inside: " + apkZip);
+            }
+
+            LocalIntentReceiver receiver = new LocalIntentReceiver();
+            session.commit(receiver.getIntentSender());
+            Intent result = receiver.getResult(120_000);
+            if (result == null) {
+                throw new IOException("Timed out waiting for install result for: " + packageName);
+            }
+            int status = result.getIntExtra(PackageInstaller.EXTRA_STATUS,
+                    PackageInstaller.STATUS_FAILURE);
+            if (status != PackageInstaller.STATUS_SUCCESS) {
+                String msg = result.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+                throw new IOException("Install failed for " + packageName + ": status=" + status + " msg=" + msg);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted waiting for install result for: " + packageName, e);
+        } finally {
+            session.close();
+        }
+
+        // Verify installed.
+        if (!isPackageInstalled(packageName)) {
+            throw new IOException("Install reported success but package not installed: " + packageName);
+        }
+    }
+
+    private static void recursiveDelete(File f) {
+        if (f == null || !f.exists()) return;
+        if (f.isDirectory()) {
+            File[] children = f.listFiles();
+            if (children != null) {
+                for (File c : children) {
+                    recursiveDelete(c);
+                }
+            }
+        }
+        // Best-effort.
+        //noinspection ResultOfMethodCallIgnored
+        f.delete();
+    }
+
+    private static final class BackupParts {
+        boolean apk;
+        boolean userCe;
+        boolean userDe;
+        boolean extData;
+        boolean obb;
+        boolean media;
+    }
+
+    private static JSONArray buildPermissionsJson(PackageInfo pi) throws JSONException {
+        JSONArray perms = new JSONArray();
+        if (pi == null || pi.requestedPermissions == null) return perms;
+
+        for (int i = 0; i < pi.requestedPermissions.length; i++) {
+            String name = pi.requestedPermissions[i];
+            boolean granted = false;
+            if (pi.requestedPermissionsFlags != null && i < pi.requestedPermissionsFlags.length) {
+                granted = (pi.requestedPermissionsFlags[i] & PackageInfo.REQUESTED_PERMISSION_GRANTED) != 0;
+            }
+            JSONObject p = new JSONObject();
+            p.put("name", name);
+            p.put("granted", granted);
+            perms.put(p);
+        }
+        return perms;
+    }
+
+    private static long fileBytesIfExists(File f) {
+        if (f == null || !f.exists() || !f.isFile()) return 0;
+        return f.length();
+    }
+
+    private File resolvePackageBackupDir(String basePath, String packageName) {
+        File base = new File(basePath);
+
+        // If caller already passed the per-package directory.
+        if (base.isDirectory() && packageName.equals(base.getName()) && looksLikePackageDir(base)) {
+            return base;
+        }
+
+        // If caller passed .../apps or .../backup.
+        if (base.isDirectory() && "apps".equals(base.getName())) {
+            File candidate = new File(base, packageName);
+            if (looksLikePackageDir(candidate)) return candidate;
+        }
+
+        if (base.isDirectory() && "backup".equals(base.getName())) {
+            File candidate = new File(new File(base, "apps"), packageName);
+            if (looksLikePackageDir(candidate)) return candidate;
+        }
+
+        // If caller passed the backup root.
+        File candidate1 = new File(base, packageName);
+        if (looksLikePackageDir(candidate1)) return candidate1;
+
+        File candidate2 = new File(new File(base, "apps"), packageName);
+        if (looksLikePackageDir(candidate2)) return candidate2;
+
+        File candidate3 = new File(new File(new File(base, "backup"), "apps"), packageName);
+        if (looksLikePackageDir(candidate3)) return candidate3;
+
+        // Default: create/use <base>/backup/apps/<pkg>
+        return candidate3;
+    }
+
+    private boolean looksLikePackageDir(File pkgDir) {
+        if (pkgDir == null || !pkgDir.isDirectory()) return false;
+        if (new File(pkgDir, FILE_CONFIG).exists()) return true;
+        return new File(pkgDir, DIR_APK).isDirectory()
+                || new File(pkgDir, DIR_INT_DATA).isDirectory()
+                || new File(pkgDir, DIR_EXT_DATA).isDirectory()
+                || new File(pkgDir, DIR_ADDL_DATA).isDirectory();
+    }
+
+    private boolean ensureDirs(File pkgDir) {
+        File apkDir = new File(pkgDir, DIR_APK);
+        File intDir = new File(pkgDir, DIR_INT_DATA);
+        File extDir = new File(pkgDir, DIR_EXT_DATA);
+        File addlDir = new File(pkgDir, DIR_ADDL_DATA);
+        return (apkDir.exists() || mkdirsMaybeDaemon(apkDir))
+                && (intDir.exists() || mkdirsMaybeDaemon(intDir))
+                && (extDir.exists() || mkdirsMaybeDaemon(extDir))
+                && (addlDir.exists() || mkdirsMaybeDaemon(addlDir));
+    }
+
+    private boolean mkdirsMaybeDaemon(File dir) {
+        if (mkdirsWithDaemon(dir)) {
+            return true;
+        }
+        return dir.mkdirs();
+    }
+
+    private boolean mkdirsWithDaemon(File dir) {
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null) return false;
+
+        android.os.Parcel data = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            data.writeString16(dir.getAbsolutePath());
+            boolean ok = daemon.transact(TRUEBACKUPD_MKDIRS, data, reply, 0);
+            if (!ok) return false;
+            int rc = reply.readInt();
+            return rc == 0;
+        } catch (RemoteException e) {
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    private boolean zipMultiFileWithDaemon(File[] sourceFiles, String[] entryNames, File outZip) {
+        if (sourceFiles == null || entryNames == null) return false;
+        if (sourceFiles.length != entryNames.length) return false;
+
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null) return false;
+
+        android.os.Parcel data = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            data.writeString16(outZip.getAbsolutePath());
+            data.writeInt(sourceFiles.length);
+            for (int i = 0; i < sourceFiles.length; i++) {
+                data.writeString16(sourceFiles[i].getAbsolutePath());
+                data.writeString16(entryNames[i]);
+            }
+
+            boolean ok = daemon.transact(TRUEBACKUPD_ZIP_MULTI_FILE, data, reply, 0);
+            if (!ok) return false;
+            int rc = reply.readInt();
+            return rc == 0;
+        } catch (RemoteException e) {
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    private boolean zipSingleFileWithDaemon(File sourceFile, File outZip, String entryName) {
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null) return false;
+
+        android.os.Parcel data = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            data.writeString16(sourceFile.getAbsolutePath());
+            data.writeString16(outZip.getAbsolutePath());
+            data.writeString16(entryName);
+            boolean ok = daemon.transact(TRUEBACKUPD_ZIP_SINGLE_FILE, data, reply, 0);
+            if (!ok) return false;
+            int rc = reply.readInt();
+            return rc == 0;
+        } catch (RemoteException e) {
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    private boolean zipApk(String packageName, File outZip) throws IOException {
+        PackageManager pm = mContext.getPackageManager();
+        ApplicationInfo ai;
+        try {
+            ai = pm.getApplicationInfo(packageName, 0);
+        } catch (PackageManager.NameNotFoundException e) {
+            Slog.e(TAG, "Package not found: " + packageName);
+            return false;
+        }
+
+        if (ai.sourceDir == null) {
+            Slog.e(TAG, "No sourceDir for: " + packageName);
+            return false;
+        }
+
+        File baseApk = new File(ai.sourceDir);
+        if (!baseApk.exists()) {
+            Slog.e(TAG, "APK not found at: " + ai.sourceDir);
+            return false;
+        }
+
+        String[] splitPaths = ai.splitSourceDirs;
+        int splitCount = (splitPaths == null) ? 0 : splitPaths.length;
+
+        File[] files = new File[1 + splitCount];
+        String[] entries = new String[1 + splitCount];
+        files[0] = baseApk;
+        entries[0] = "base.apk";
+        for (int i = 0; i < splitCount; i++) {
+            File f = new File(splitPaths[i]);
+            files[1 + i] = f;
+            entries[1 + i] = f.getName();
+        }
+
+        // Prefer daemon (system_server may not be allowed to read split APKs under /data/app).
+        if (zipMultiFileWithDaemon(files, entries, outZip)) {
+            return true;
+        }
+
+        // Fallback: create zip in Java (may fail under SELinux, but keeps behavior consistent).
+        File parent = outZip.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("Could not create directory: " + parent);
+        }
+
+        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outZip))) {
+            for (int i = 0; i < files.length; i++) {
+                File f = files[i];
+                if (f == null || !f.exists() || !f.isFile()) {
+                    continue;
+                }
+                zos.putNextEntry(new ZipEntry(entries[i]));
+                try (FileInputStream in = new FileInputStream(f)) {
+                    copy(in, zos);
+                }
+                zos.closeEntry();
+            }
+        }
+
+        return true;
+    }
+
+    private boolean zipDirIfExists(File sourceDir, File outZip) throws IOException {
+        // Try daemon first: system_server may not be able to stat /data_mirror paths due to SELinux.
+        if (zipDirectoryWithDaemon(sourceDir, outZip)) {
+            return true;
+        }
+
+        if (!sourceDir.exists()) {
+            return false;
+        }
+
+        zipDirectory(sourceDir, outZip);
+        return true;
+    }
+
+    private void zipSingleFile(File sourceFile, File outZip, String entryName) throws IOException {
+        if (zipSingleFileWithDaemon(sourceFile, outZip, entryName)) {
+            return;
+        }
+
+        File parent = outZip.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("Could not create directory: " + parent);
+        }
+
+        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outZip))) {
+            ZipEntry entry = new ZipEntry(entryName);
+            zos.putNextEntry(entry);
+            try (FileInputStream in = new FileInputStream(sourceFile)) {
+                copy(in, zos);
+            }
+            zos.closeEntry();
+        }
+    }
+
+    private void zipDirectory(File sourceDir, File outZip) throws IOException {
+        File parent = outZip.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("Could not create directory: " + parent);
+        }
+
+        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outZip))) {
+            zipDirectoryInternal(sourceDir, sourceDir, zos);
+        }
+    }
+
+    private void zipDirectoryInternal(File rootDir, File current, ZipOutputStream zos) throws IOException {
+        File[] children = current.listFiles();
+        if (children == null) return;
+
+        for (File child : children) {
+            String entryName = rootDir.toURI().relativize(child.toURI()).getPath();
+            if (child.isDirectory()) {
+                if (!entryName.endsWith("/")) entryName = entryName + "/";
+                zos.putNextEntry(new ZipEntry(entryName));
+                zos.closeEntry();
+                zipDirectoryInternal(rootDir, child, zos);
+            } else {
+                zos.putNextEntry(new ZipEntry(entryName));
+                try (FileInputStream in = new FileInputStream(child)) {
+                    copy(in, zos);
+                }
+                zos.closeEntry();
+            }
+        }
+    }
+
+    private void restoreFromPackageDir(String packageName, File pkgDir) throws IOException {
+        // If the app is not installed, install it first from apk.zip so /data_mirror targets exist.
+        installApksFromBackupIfNeeded(packageName, pkgDir);
+
+        File ceZip = firstExisting(
+                new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER),
+                new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_CE_LEGACY));
+        if (ceZip != null) {
+            unzipToDirMaybeDaemon(ceZip, new File(CE_BASE, packageName));
+            unzipToDirMaybeDaemon(ceZip, new File(new File("/data/data"), packageName));
+        }
+
+        File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
+        if (deZip.exists()) {
+            unzipToDirMaybeDaemon(deZip, new File(DE_BASE, packageName));
+        }
+
+        File extZip = firstExisting(
+                new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA),
+                new File(new File(pkgDir, DIR_EXT_DATA), ZIP_EXT_DATA_LEGACY));
+        if (extZip != null) {
+            unzipToDirMaybeDaemon(extZip, new File(EXT_DATA_BASE, packageName));
+        }
+
+        File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
+        if (obbZip.exists()) {
+            unzipToDirMaybeDaemon(obbZip, new File(OBB_BASE, packageName));
+        }
+
+        File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
+        if (mediaZip.exists()) {
+            unzipToDirMaybeDaemon(mediaZip, new File(MEDIA_BASE, packageName));
+        }
+    }
+
+    private boolean zipDirectoryWithDaemon(File sourceDir, File outZip) {
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null) return false;
+
+        android.os.Parcel data = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            data.writeString16(sourceDir.getAbsolutePath());
+            data.writeString16(outZip.getAbsolutePath());
+            boolean ok = daemon.transact(TRUEBACKUPD_ZIP_DIR, data, reply, 0);
+            if (!ok) return false;
+            int rc = reply.readInt();
+            return rc == 0;
+        } catch (RemoteException e) {
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    private void unzipToDirMaybeDaemon(File zipFile, File targetDir) throws IOException {
+        if (unzipToDirWithDaemon(zipFile, targetDir)) {
+            return;
+        }
+        unzipToDir(zipFile, targetDir);
+    }
+
+    private boolean unzipToDirWithDaemon(File zipFile, File targetDir) {
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null) return false;
+
+        android.os.Parcel data = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            data.writeString16(zipFile.getAbsolutePath());
+            data.writeString16(targetDir.getAbsolutePath());
+            boolean ok = daemon.transact(TRUEBACKUPD_UNZIP_TO_DIR, data, reply, 0);
+            if (!ok) return false;
+            int rc = reply.readInt();
+            return rc == 0;
+        } catch (RemoteException e) {
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    private File firstExisting(File a, File b) {
+        if (a.exists()) return a;
+        if (b.exists()) return b;
+        return null;
+    }
+
+    private void unzipToDir(File zipFile, File targetDir) throws IOException {
+        if (!targetDir.exists() && !targetDir.mkdirs()) {
+            throw new IOException("Could not create directory: " + targetDir);
+        }
+
+        try (ZipInputStream zis = new ZipInputStream(new FileInputStream(zipFile))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                File out = new File(targetDir, entry.getName());
+                if (!isSubPath(targetDir, out)) {
+                    throw new IOException("Zip entry path traversal: " + entry.getName());
+                }
+
+                if (entry.isDirectory()) {
+                    if (!out.exists() && !out.mkdirs()) {
+                        throw new IOException("Could not create directory: " + out);
+                    }
+                } else {
+                    File parent = out.getParentFile();
+                    if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                        throw new IOException("Could not create directory: " + parent);
+                    }
+                    try (FileOutputStream fos = new FileOutputStream(out)) {
+                        copy(zis, fos);
+                    }
+                }
+                zis.closeEntry();
+            }
+        }
+    }
+
+    private boolean isSubPath(File base, File child) throws IOException {
+        String basePath = base.getCanonicalPath();
+        String childPath = child.getCanonicalPath();
+        return childPath.equals(basePath) || childPath.startsWith(basePath + File.separator);
+    }
+
+    private void writeConfig(File outConfig, String packageName, BackupParts parts)
+            throws IOException, JSONException {
+        final long now = System.currentTimeMillis();
+        final PackageManager pm = mContext.getPackageManager();
+
+        PackageInfo pi = null;
+        ApplicationInfo ai = null;
+        try {
+            pi = pm.getPackageInfo(packageName, PackageManager.GET_PERMISSIONS);
+            ai = pi.applicationInfo;
+        } catch (PackageManager.NameNotFoundException e) {
+            // Keep config generation best-effort.
+        }
+
+        String label = null;
+        if (ai != null) {
+            CharSequence cs = pm.getApplicationLabel(ai);
+            if (cs != null) label = cs.toString();
+        }
+
+        JSONObject obj = new JSONObject();
+        obj.put("version", 2);
+        obj.put("package", packageName);
+        obj.put("apk", parts.apk);
+        obj.put("user_ce", parts.userCe);
+        obj.put("user_de", parts.userDe);
+        obj.put("ext_data", parts.extData);
+        obj.put("obb", parts.obb);
+        obj.put("media", parts.media);
+
+        JSONObject pkgInfo = new JSONObject();
+        pkgInfo.put("label", label);
+        if (pi != null) {
+            pkgInfo.put("versionName", pi.versionName);
+            pkgInfo.put("versionCode", pi.getLongVersionCode());
+            pkgInfo.put("firstInstallTime", pi.firstInstallTime);
+            pkgInfo.put("lastUpdateTime", pi.lastUpdateTime);
+        }
+        if (ai != null) {
+            pkgInfo.put("flags", ai.flags);
+            pkgInfo.put("uid", ai.uid);
+            pkgInfo.put("sourceDir", ai.sourceDir);
+        }
+        obj.put("packageInfo", pkgInfo);
+
+        JSONObject backupConfig = new JSONObject();
+        backupConfig.put("packageName", packageName);
+        backupConfig.put("userId", 0);
+        backupConfig.put("compression", "zip");
+        backupConfig.put("preserveId", now);
+        File pkgDir = outConfig.getParentFile();
+        backupConfig.put("storagePath", pkgDir != null ? pkgDir.getAbsolutePath() : null);
+        backupConfig.put("createdAt", now);
+        obj.put("backupConfig", backupConfig);
+
+        JSONObject dataStates = new JSONObject();
+        dataStates.put("apk", parts.apk);
+        dataStates.put("userCe", parts.userCe);
+        dataStates.put("userDe", parts.userDe);
+        dataStates.put("externalData", parts.extData);
+        dataStates.put("obb", parts.obb);
+        dataStates.put("media", parts.media);
+        obj.put("dataStates", dataStates);
+
+        JSONObject dataStats = new JSONObject();
+        if (pkgDir != null) {
+            dataStats.put("apkBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_APK), ZIP_APK)));
+            dataStats.put("userBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER)));
+            dataStats.put("userDeBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE)));
+            dataStats.put("dataBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA)));
+            dataStats.put("obbBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB)));
+            dataStats.put("mediaBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA)));
+        }
+        obj.put("dataStats", dataStats);
+
+        JSONObject security = new JSONObject();
+        if (ai != null) security.put("uid", ai.uid);
+        // SSAID is not reliably accessible to system_server for arbitrary packages
+        // without dedicated settings provider access; keep schema stable.
+        security.put("ssaid", JSONObject.NULL);
+        security.put("keystore", "unknown");
+        security.put("appops", new JSONArray());
+        security.put("permissions", buildPermissionsJson(pi));
+        obj.put("security", security);
+
+        byte[] data = obj.toString(2).getBytes(StandardCharsets.UTF_8);
+
+        if (writeFileWithDaemon(outConfig, data)) {
+            return;
+        }
+
+        File parent = outConfig.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("Could not create directory: " + parent);
+        }
+
+        try (FileOutputStream fos = new FileOutputStream(outConfig)) {
+            fos.write(data);
+        }
+    }
+
+    private boolean writeFileWithDaemon(File outFile, byte[] data) {
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null) return false;
+
+        android.os.Parcel parcel = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            parcel.writeInt(TRUEBACKUPD_TOKEN);
+            parcel.writeString16(outFile.getAbsolutePath());
+            parcel.writeByteArray(data);
+            boolean ok = daemon.transact(TRUEBACKUPD_WRITE_FILE, parcel, reply, 0);
+            if (!ok) return false;
+            int rc = reply.readInt();
+            return rc == 0;
+        } catch (RemoteException e) {
+            return false;
+        } finally {
+            reply.recycle();
+            parcel.recycle();
+        }
     }
 
     private void recursiveCopy(File source, File destination) throws IOException {
@@ -125,6 +936,30 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                     out.write(buf, 0, len);
                 }
             }
+        }
+    }
+
+    private void copy(FileInputStream in, FileOutputStream out) throws IOException {
+        byte[] buf = new byte[1024 * 16];
+        int len;
+        while ((len = in.read(buf)) > 0) {
+            out.write(buf, 0, len);
+        }
+    }
+
+    private void copy(FileInputStream in, ZipOutputStream out) throws IOException {
+        byte[] buf = new byte[1024 * 16];
+        int len;
+        while ((len = in.read(buf)) > 0) {
+            out.write(buf, 0, len);
+        }
+    }
+
+    private void copy(ZipInputStream in, FileOutputStream out) throws IOException {
+        byte[] buf = new byte[1024 * 16];
+        int len;
+        while ((len = in.read(buf)) > 0) {
+            out.write(buf, 0, len);
         }
     }
 }

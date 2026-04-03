@@ -1,0 +1,25 @@
+package {
+    default_applicable_licenses: ["frameworks_base_license"],
+}
+
+cc_binary {
+    name: "truebackupd",
+    srcs: [
+        "truebackupd.cpp",
+    ],
+    shared_libs: [
+        "libbase",
+        "libbinder",
+        "liblog",
+        "libutils",
+        "libziparchive",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wextra",
+        "-Wno-unused-parameter",
+    ],
+    init_rc: ["truebackupd.rc"],
+    system_ext_specific: true,
+}
