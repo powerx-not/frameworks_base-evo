@@ -25,6 +25,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <selinux/android.h>
+
 #include <set>
 #include <string>
 #include <vector>
@@ -46,6 +48,8 @@ enum Transaction : uint32_t {
     ZIP_SINGLE_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 3,
     ZIP_MULTI_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 4,
     WRITE_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 5,
+    /** Recursive chown + selinux_android_restorecon (matches backup tools that fix ownership after extract). */
+    CHOWN_AND_RESTORECON = android::IBinder::FIRST_CALL_TRANSACTION + 6,
 };
 
 static std::string Dirname(const std::string& path) {
@@ -61,6 +65,8 @@ static bool ZipAddFile(ZipWriter& writer, const std::string& absPath, const std:
 static bool ZipDir(const std::string& srcDir, const std::string& outZip);
 static bool UnzipToDir(const std::string& zipPath, const std::string& outDir);
 static bool IsPathTraversal(const std::string& entryName);
+static bool ChownRecursive(const std::string& path, uid_t uid, gid_t gid);
+static bool FixupOwnershipAndSelinux(const std::string& path, int32_t uid, int32_t gid);
 
 static bool WriteFileAtomic(const std::string& outPath, const uint8_t* data, size_t dataLen) {
     std::string outParent = Dirname(outPath);
@@ -432,6 +438,69 @@ static bool UnzipToDir(const std::string& zipPath, const std::string& outDir) {
     return true;
 }
 
+static bool ChownRecursive(const std::string& path, uid_t uid, gid_t gid) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0) {
+        PLOG(ERROR) << "lstat failed: " << path;
+        return false;
+    }
+
+    if (lchown(path.c_str(), uid, gid) != 0) {
+        PLOG(ERROR) << "lchown failed: " << path;
+        return false;
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        return true;
+    }
+
+    DIR* dir = opendir(path.c_str());
+    if (!dir) {
+        PLOG(ERROR) << "opendir failed: " << path;
+        return false;
+    }
+
+    dirent* de;
+    bool ok = true;
+    while ((de = readdir(dir)) != nullptr) {
+        if (IsDotOrDotDot(de->d_name)) continue;
+        std::string child = path + "/" + de->d_name;
+        if (!ChownRecursive(child, uid, gid)) {
+            ok = false;
+        }
+    }
+    closedir(dir);
+    return ok;
+}
+
+static bool FixupOwnershipAndSelinux(const std::string& path, int32_t uid32, int32_t gid32) {
+    if (path.empty() || path[0] != '/') {
+        LOG(ERROR) << "Invalid path for fixup: " << path;
+        return false;
+    }
+
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0) {
+        LOG(ERROR) << "Fixup path missing: " << path;
+        return false;
+    }
+
+    uid_t uid = static_cast<uid_t>(uid32);
+    gid_t gid = (gid32 < 0) ? uid : static_cast<gid_t>(gid32);
+
+    if (!ChownRecursive(path, uid, gid)) {
+        return false;
+    }
+
+    unsigned int flags = SELINUX_ANDROID_RESTORECON_RECURSE | SELINUX_ANDROID_RESTORECON_SKIP_SEHASH;
+    if (selinux_android_restorecon(path.c_str(), flags) != 0) {
+        PLOG(ERROR) << "selinux_android_restorecon failed: " << path;
+        return false;
+    }
+
+    return true;
+}
+
 class TrueBackupDaemonService : public android::BBinder {
   public:
     android::status_t onTransact(uint32_t code, const android::Parcel& data,
@@ -519,6 +588,19 @@ class TrueBackupDaemonService : public android::BBinder {
 
                 const uint8_t* bytes = reinterpret_cast<const uint8_t*>(p);
                 bool ok = WriteFileAtomic(out, bytes, static_cast<size_t>(len));
+                reply->writeInt32(ok ? 0 : -1);
+                return android::NO_ERROR;
+            }
+            case CHOWN_AND_RESTORECON: {
+                std::string p = std::string(android::String8(data.readString16()).c_str());
+                int32_t uid = data.readInt32();
+                int32_t gid = data.readInt32();
+                if (uid < 0) {
+                    LOG(ERROR) << "Invalid uid for CHOWN_AND_RESTORECON";
+                    reply->writeInt32(-1);
+                    return android::NO_ERROR;
+                }
+                bool ok = FixupOwnershipAndSelinux(p, uid, gid);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }

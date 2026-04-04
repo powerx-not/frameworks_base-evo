@@ -11,6 +11,7 @@ cc_binary {
         "libbase",
         "libbinder",
         "liblog",
+        "libselinux",
         "libutils",
         "libziparchive",
     ],

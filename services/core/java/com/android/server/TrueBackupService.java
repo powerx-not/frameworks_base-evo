@@ -9,7 +9,10 @@ import android.content.pm.PackageManager;
 import android.os.IBinder;
 import android.os.ITrueBackupService;
 import android.os.RemoteException;
+import android.os.SELinux;
 import android.os.ServiceManager;
+import android.system.ErrnoException;
+import android.system.Os;
 import android.util.Slog;
 
 import org.json.JSONArray;
@@ -47,6 +50,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final int TRUEBACKUPD_ZIP_SINGLE_FILE = IBinder.FIRST_CALL_TRANSACTION + 3;
     private static final int TRUEBACKUPD_ZIP_MULTI_FILE = IBinder.FIRST_CALL_TRANSACTION + 4;
     private static final int TRUEBACKUPD_WRITE_FILE = IBinder.FIRST_CALL_TRANSACTION + 5;
+    private static final int TRUEBACKUPD_CHOWN_AND_RESTORECON = IBinder.FIRST_CALL_TRANSACTION + 6;
 
     private static final String FILE_CONFIG = "package_restore_config.json";
 
@@ -70,6 +74,11 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final String EXT_DATA_BASE = "/data/media/0/Android/data/";
     private static final String OBB_BASE = "/data/media/0/Android/obb/";
     private static final String MEDIA_BASE = "/data/media/0/Android/media/";
+
+    /** Parent dirs whose GID external/OBB/media trees inherit (see DataBackup restoreData). */
+    private static final String EXT_DATA_GID_REF = "/data/media/0/Android/data";
+    private static final String OBB_GID_REF = "/data/media/0/Android/obb";
+    private static final String MEDIA_GID_REF = "/data/media/0/Android/media";
 
     public TrueBackupService(Context context) {
         mContext = context;
@@ -151,6 +160,14 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                 } else if (legacyDir.exists()) {
                     File dataDir = new File("/data/data/" + packageName);
                     recursiveCopy(legacyDir, dataDir);
+                    if (isPackageInstalled(packageName)) {
+                        try {
+                            int appUid = getApplicationUidOrThrow(packageName);
+                            fixupRestoredTree(dataDir, appUid, appUid);
+                        } catch (IOException e) {
+                            Slog.w(TAG, "Legacy restore: could not fix ownership for " + packageName, e);
+                        }
+                    }
                 } else {
                     Slog.e(TAG, "Source data not found at " + sourcePath);
                     return;
@@ -668,33 +685,116 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         // If the app is not installed, install it first from apk.zip so /data_mirror targets exist.
         installApksFromBackupIfNeeded(packageName, pkgDir);
 
+        final int appUid = getApplicationUidOrThrow(packageName);
+
         File ceZip = firstExisting(
                 new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER),
                 new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_CE_LEGACY));
         if (ceZip != null) {
-            unzipToDirMaybeDaemon(ceZip, new File(CE_BASE, packageName));
+            File target = new File(CE_BASE, packageName);
+            unzipToDirMaybeDaemon(ceZip, target);
+            fixupRestoredTree(target, appUid, appUid);
         }
 
         File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
         if (deZip.exists()) {
-            unzipToDirMaybeDaemon(deZip, new File(DE_BASE, packageName));
+            File target = new File(DE_BASE, packageName);
+            unzipToDirMaybeDaemon(deZip, target);
+            fixupRestoredTree(target, appUid, appUid);
         }
 
         File extZip = firstExisting(
                 new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA),
                 new File(new File(pkgDir, DIR_EXT_DATA), ZIP_EXT_DATA_LEGACY));
         if (extZip != null) {
-            unzipToDirMaybeDaemon(extZip, new File(EXT_DATA_BASE, packageName));
+            File target = new File(EXT_DATA_BASE, packageName);
+            unzipToDirMaybeDaemon(extZip, target);
+            int extGid = statDirGidOrUid(EXT_DATA_GID_REF, appUid);
+            fixupRestoredTree(target, appUid, extGid);
         }
 
         File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
         if (obbZip.exists()) {
-            unzipToDirMaybeDaemon(obbZip, new File(OBB_BASE, packageName));
+            File target = new File(OBB_BASE, packageName);
+            unzipToDirMaybeDaemon(obbZip, target);
+            int obbGid = statDirGidOrUid(OBB_GID_REF, appUid);
+            fixupRestoredTree(target, appUid, obbGid);
         }
 
         File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
         if (mediaZip.exists()) {
-            unzipToDirMaybeDaemon(mediaZip, new File(MEDIA_BASE, packageName));
+            File target = new File(MEDIA_BASE, packageName);
+            unzipToDirMaybeDaemon(mediaZip, target);
+            int mediaGid = statDirGidOrUid(MEDIA_GID_REF, appUid);
+            fixupRestoredTree(target, appUid, mediaGid);
+        }
+    }
+
+    private int getApplicationUidOrThrow(String packageName) throws IOException {
+        try {
+            ApplicationInfo ai = mContext.getPackageManager().getApplicationInfo(packageName, 0);
+            return ai.uid;
+        } catch (PackageManager.NameNotFoundException e) {
+            throw new IOException("Package not installed: " + packageName, e);
+        }
+    }
+
+    private static int statDirGidOrUid(String dirPath, int uidFallback) {
+        try {
+            return (int) Os.stat(dirPath).st_gid;
+        } catch (ErrnoException e) {
+            Slog.w(TAG, "stat failed for " + dirPath + "; using app uid as gid", e);
+            return uidFallback;
+        }
+    }
+
+    /**
+     * Extracted files are owned by root; relabel and chown so the app can run (same idea as
+     * {@code PackagesRestoreUtil.restoreData} in Android-DataBackup).
+     */
+    private void fixupRestoredTree(File path, int uid, int gid) {
+        if (path == null || !path.exists()) {
+            return;
+        }
+        String abs;
+        try {
+            abs = path.getCanonicalPath();
+        } catch (IOException e) {
+            Slog.e(TAG, "fixup: bad path " + path, e);
+            return;
+        }
+        if (chownAndRestoreconWithDaemon(abs, uid, gid)) {
+            return;
+        }
+        Slog.w(TAG, "truebackupd fixup failed for " + abs + "; trying SELinux.restoreconRecursive only");
+        if (!SELinux.restoreconRecursive(path)) {
+            Slog.e(TAG, "SELinux.restoreconRecursive failed for " + abs);
+        }
+    }
+
+    private boolean chownAndRestoreconWithDaemon(String absolutePath, int uid, int gid) {
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null) {
+            return false;
+        }
+        android.os.Parcel data = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            data.writeString16(absolutePath);
+            data.writeInt(uid);
+            data.writeInt(gid);
+            boolean ok = daemon.transact(TRUEBACKUPD_CHOWN_AND_RESTORECON, data, reply, 0);
+            if (!ok) {
+                return false;
+            }
+            return reply.readInt() == 0;
+        } catch (RemoteException e) {
+            Slog.w(TAG, "chown/restorecon transact failed", e);
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
         }
     }
 
