@@ -1,23 +1,30 @@
 package com.android.server;
 
+import android.app.AppOpsManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
+import android.os.Environment;
 import android.os.IBinder;
 import android.os.ITrueBackupService;
 import android.os.RemoteException;
 import android.os.SELinux;
 import android.os.ServiceManager;
+import android.os.UserHandle;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.util.Slog;
+import android.util.Xml;
+
+import com.android.internal.app.IAppOpsService;
 
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.xmlpull.v1.XmlPullParser;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -79,6 +86,11 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final String EXT_DATA_GID_REF = "/data/media/0/Android/data";
     private static final String OBB_GID_REF = "/data/media/0/Android/obb";
     private static final String MEDIA_GID_REF = "/data/media/0/Android/media";
+
+    private static final String SETTINGS_FILE_SSAID = "settings_ssaid.xml";
+
+    /** User id for CE/DE paths and permission restore (matches fixed CE_BASE user). */
+    private static final int BACKUP_RESTORE_USER_ID = UserHandle.USER_SYSTEM;
 
     public TrueBackupService(Context context) {
         mContext = context;
@@ -167,6 +179,10 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                         } catch (IOException e) {
                             Slog.w(TAG, "Legacy restore: could not fix ownership for " + packageName, e);
                         }
+                    }
+                    File cfgDir = resolvePackageBackupDir(sourcePath, packageName);
+                    if (cfgDir != null && new File(cfgDir, FILE_CONFIG).isFile()) {
+                        applySecurityRestoreFromConfig(packageName, cfgDir);
                     }
                 } else {
                     Slog.e(TAG, "Source data not found at " + sourcePath);
@@ -728,6 +744,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             int mediaGid = statDirGidOrUid(MEDIA_GID_REF, appUid);
             fixupRestoredTree(target, appUid, mediaGid);
         }
+
+        applySecurityRestoreFromConfig(packageName, pkgDir);
     }
 
     private int getApplicationUidOrThrow(String packageName) throws IOException {
@@ -969,11 +987,14 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
         JSONObject security = new JSONObject();
         if (ai != null) security.put("uid", ai.uid);
-        // SSAID is not reliably accessible to system_server for arbitrary packages
-        // without dedicated settings provider access; keep schema stable.
-        security.put("ssaid", JSONObject.NULL);
+        String ssaidHex = (ai != null) ? readSsaidHexFromDisk(BACKUP_RESTORE_USER_ID, ai.uid) : null;
+        if (ssaidHex != null && !ssaidHex.isEmpty()) {
+            security.put("ssaid", ssaidHex);
+        } else {
+            security.put("ssaid", JSONObject.NULL);
+        }
         security.put("keystore", "unknown");
-        security.put("appops", new JSONArray());
+        security.put("appops", buildAppOpsJson(packageName, ai != null ? ai.uid : -1));
         security.put("permissions", buildPermissionsJson(pi));
         obj.put("security", security);
 
@@ -1060,5 +1081,161 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         while ((len = in.read(buf)) > 0) {
             out.write(buf, 0, len);
         }
+    }
+
+    /**
+     * Reads per-app SSAID from {@code settings_ssaid.xml} (same backing store as
+     * {@link android.provider.Settings.Secure#ANDROID_ID} for apps). Keys are app UIDs as strings.
+     */
+    private static String readSsaidHexFromDisk(int userId, int appUid) {
+        File base = Environment.getUserSystemDirectory(userId);
+        File f = new File(base, SETTINGS_FILE_SSAID);
+        if (!f.isFile() || !f.canRead()) {
+            return null;
+        }
+        final String uidKey = Integer.toString(appUid);
+        try (FileInputStream in = new FileInputStream(f)) {
+            XmlPullParser parser = Xml.newPullParser();
+            parser.setInput(in, StandardCharsets.UTF_8.name());
+            int event;
+            while ((event = parser.next()) != XmlPullParser.END_DOCUMENT) {
+                if (event != XmlPullParser.START_TAG) continue;
+                if (!"setting".equals(parser.getName())) continue;
+                String name = parser.getAttributeValue(null, "name");
+                if (!uidKey.equals(name)) continue;
+                return parser.getAttributeValue(null, "value");
+            }
+        } catch (Exception e) {
+            Slog.w(TAG, "readSsaidHexFromDisk: failed for uid " + appUid, e);
+        }
+        return null;
+    }
+
+    private JSONArray buildAppOpsJson(String packageName, int uid) {
+        JSONArray arr = new JSONArray();
+        if (uid < 0 || packageName == null) {
+            return arr;
+        }
+        AppOpsManager aom = mContext.getSystemService(AppOpsManager.class);
+        if (aom == null) {
+            return arr;
+        }
+        try {
+            List<AppOpsManager.PackageOps> pkgOps =
+                    aom.getOpsForPackage(uid, packageName, (String[]) null);
+            if (pkgOps == null) {
+                return arr;
+            }
+            for (AppOpsManager.PackageOps po : pkgOps) {
+                List<AppOpsManager.OpEntry> entries = po.getOps();
+                if (entries == null) continue;
+                for (AppOpsManager.OpEntry oe : entries) {
+                    JSONObject o = new JSONObject();
+                    o.put("op", oe.getOp());
+                    o.put("mode", oe.getMode());
+                    arr.put(o);
+                }
+            }
+        } catch (Exception e) {
+            Slog.w(TAG, "buildAppOpsJson failed for " + packageName, e);
+        }
+        return arr;
+    }
+
+    private void applySecurityRestoreFromConfig(String packageName, File pkgDir) {
+        File cfg = new File(pkgDir, FILE_CONFIG);
+        if (!cfg.isFile()) {
+            return;
+        }
+        try {
+            String json = new String(readFully(cfg), StandardCharsets.UTF_8);
+            JSONObject root = new JSONObject(json);
+            applySecurityFromJson(packageName, root.optJSONObject("security"));
+        } catch (Exception e) {
+            Slog.w(TAG, "Security restore skipped for " + packageName, e);
+        }
+    }
+
+    /**
+     * Re-apply runtime permissions and AppOp modes from backup metadata (DataBackup-style).
+     * SSAID is stored in backups when readable from disk but cannot be written back safely from
+     * system_server without a dedicated Settings API.
+     */
+    private void applySecurityFromJson(String packageName, JSONObject security) {
+        if (security == null) {
+            return;
+        }
+        if (security.has("ssaid") && !security.isNull("ssaid")) {
+            String ssaid = security.optString("ssaid", "");
+            if (!ssaid.isEmpty()) {
+                Slog.i(TAG, "Backup contains SSAID for " + packageName
+                        + "; restore not implemented (requires SettingsProvider support).");
+            }
+        }
+
+        int uid;
+        try {
+            uid = getApplicationUidOrThrow(packageName);
+        } catch (IOException e) {
+            Slog.w(TAG, "Security restore: package not installed " + packageName);
+            return;
+        }
+
+        try {
+            resetAppOpsForPackage(BACKUP_RESTORE_USER_ID, packageName);
+        } catch (RemoteException e) {
+            Slog.w(TAG, "reset app ops failed for " + packageName, e);
+        }
+
+        PackageManager pm = mContext.getPackageManager();
+        UserHandle user = UserHandle.of(BACKUP_RESTORE_USER_ID);
+        JSONArray perms = security.optJSONArray("permissions");
+        if (perms != null) {
+            for (int i = 0; i < perms.length(); i++) {
+                JSONObject p = perms.optJSONObject(i);
+                if (p == null) continue;
+                String perm = p.optString("name", null);
+                if (perm == null || perm.isEmpty()) continue;
+                boolean wantGrant = p.optBoolean("granted", false);
+                try {
+                    if (wantGrant) {
+                        pm.grantRuntimePermission(packageName, perm, user);
+                    } else {
+                        pm.revokeRuntimePermission(packageName, perm, user);
+                    }
+                } catch (Exception e) {
+                    Slog.w(TAG, "permission " + perm + " for " + packageName + ": " + e);
+                }
+            }
+        }
+
+        JSONArray ops = security.optJSONArray("appops");
+        if (ops != null) {
+            AppOpsManager aom = mContext.getSystemService(AppOpsManager.class);
+            if (aom != null) {
+                for (int i = 0; i < ops.length(); i++) {
+                    JSONObject o = ops.optJSONObject(i);
+                    if (o == null) continue;
+                    int op = o.optInt("op", -1);
+                    int mode = o.optInt("mode", AppOpsManager.MODE_DEFAULT);
+                    if (op < 0) continue;
+                    try {
+                        aom.setMode(op, uid, packageName, mode);
+                    } catch (Exception e) {
+                        Slog.w(TAG, "appop op=" + op + " pkg=" + packageName + ": " + e);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void resetAppOpsForPackage(int userId, String packageName)
+            throws RemoteException {
+        IBinder b = ServiceManager.getService(Context.APP_OPS_SERVICE);
+        if (b == null) {
+            return;
+        }
+        IAppOpsService svc = IAppOpsService.Stub.asInterface(b);
+        svc.resetAllModes(userId, packageName);
     }
 }
