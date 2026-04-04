@@ -65,8 +65,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final String ZIP_USER_CE_LEGACY = "user_ce.zip";
     private static final String ZIP_EXT_DATA_LEGACY = "external_data.zip";
 
-    private static final String CE_BASE = "/data_mirror/data_ce/null/0/";
-    private static final String DE_BASE = "/data_mirror/data_de/null/0/";
+    private static final String CE_BASE = "/data/user/0/";
+    private static final String DE_BASE = "/data/user_de/0/";
     private static final String EXT_DATA_BASE = "/data/media/0/Android/data/";
     private static final String OBB_BASE = "/data/media/0/Android/obb/";
     private static final String MEDIA_BASE = "/data/media/0/Android/media/";
@@ -673,7 +673,6 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                 new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_CE_LEGACY));
         if (ceZip != null) {
             unzipToDirMaybeDaemon(ceZip, new File(CE_BASE, packageName));
-            unzipToDirMaybeDaemon(ceZip, new File(new File("/data/data"), packageName));
         }
 
         File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
