@@ -7,6 +7,7 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
+import android.content.pm.PermissionInfo;
 import android.os.Environment;
 import android.os.IBinder;
 import android.os.ITrueBackupService;
@@ -412,15 +413,31 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         boolean media;
     }
 
-    private static JSONArray buildPermissionsJson(PackageInfo pi) throws JSONException {
+    /**
+     * Only runtime (dangerous) permissions — the ones {@link PackageManager#grantRuntimePermission}
+     * can change. Omitting install-time / signature permissions keeps the config small and avoids
+     * restore-time noise for permissions that cannot be toggled.
+     */
+    private static JSONArray buildPermissionsJson(PackageManager pm, PackageInfo pi)
+            throws JSONException {
         JSONArray perms = new JSONArray();
         if (pi == null || pi.requestedPermissions == null) return perms;
 
         for (int i = 0; i < pi.requestedPermissions.length; i++) {
             String name = pi.requestedPermissions[i];
+            if (name == null || name.isEmpty()) continue;
+            try {
+                PermissionInfo permInfo = pm.getPermissionInfo(name, 0);
+                if (!permInfo.isRuntime()) {
+                    continue;
+                }
+            } catch (PackageManager.NameNotFoundException e) {
+                continue;
+            }
             boolean granted = false;
             if (pi.requestedPermissionsFlags != null && i < pi.requestedPermissionsFlags.length) {
-                granted = (pi.requestedPermissionsFlags[i] & PackageInfo.REQUESTED_PERMISSION_GRANTED) != 0;
+                granted = (pi.requestedPermissionsFlags[i] & PackageInfo.REQUESTED_PERMISSION_GRANTED)
+                        != 0;
             }
             JSONObject p = new JSONObject();
             p.put("name", name);
@@ -428,6 +445,17 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             perms.put(p);
         }
         return perms;
+    }
+
+    private static boolean isRuntimePermission(PackageManager pm, String name) {
+        if (name == null || name.isEmpty()) {
+            return false;
+        }
+        try {
+            return pm.getPermissionInfo(name, 0).isRuntime();
+        } catch (PackageManager.NameNotFoundException e) {
+            return false;
+        }
     }
 
     private static long fileBytesIfExists(File f) {
@@ -995,7 +1023,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
         security.put("keystore", "unknown");
         security.put("appops", buildAppOpsJson(packageName, ai != null ? ai.uid : -1));
-        security.put("permissions", buildPermissionsJson(pi));
+        security.put("permissions", buildPermissionsJson(pm, pi));
         obj.put("security", security);
 
         byte[] data = obj.toString(2).getBytes(StandardCharsets.UTF_8);
@@ -1196,6 +1224,9 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                 if (p == null) continue;
                 String perm = p.optString("name", null);
                 if (perm == null || perm.isEmpty()) continue;
+                if (!isRuntimePermission(pm, perm)) {
+                    continue;
+                }
                 boolean wantGrant = p.optBoolean("granted", false);
                 try {
                     if (wantGrant) {
