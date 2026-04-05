@@ -7,6 +7,15 @@ interface ITrueBackupService {
     String[] listBackedUpApps(String basePath);
     boolean isOperationInProgress();
 
+    /** {@code "backup"} or {@code "restore"} while a job runs; null when idle. */
+    String getActiveOperationKind();
+
+    /** Package name of the job currently executing; null when idle. */
+    String getActiveOperationPackage();
+
+    /** Jobs waiting in the queue (not including the one currently running). */
+    int getQueuedOperationCount();
+
     /** Absolute path to the per-package backup dir containing package_restore_config.json, or null. */
     String resolveBackupPackageDir(String basePath, String packageName);
 

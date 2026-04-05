@@ -37,6 +37,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -49,7 +50,24 @@ import java.util.zip.ZipOutputStream;
 public class TrueBackupService extends ITrueBackupService.Stub {
     private static final String TAG = "TrueBackupService";
     private final Context mContext;
-    private boolean mInProgress = false;
+
+    private static final class QueuedOperation {
+        final boolean restore;
+        final String packageName;
+        final String path;
+
+        QueuedOperation(boolean restore, String packageName, String path) {
+            this.restore = restore;
+            this.packageName = packageName;
+            this.path = path;
+        }
+    }
+
+    private final LinkedBlockingQueue<QueuedOperation> mOperationQueue = new LinkedBlockingQueue<>();
+    private final AtomicInteger mWorkInFlight = new AtomicInteger(0);
+    private volatile boolean mWorkerRunning = false;
+    private String mActiveOperationKind = null;
+    private String mActiveOperationPackage = null;
 
     private static final String TRUEBACKUPD_SERVICE = "truebackupd";
     private static final int TRUEBACKUPD_TOKEN = 0x5452424b; // 'TRBK'
@@ -101,111 +119,183 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     }
 
     @Override
-    public synchronized void backupPackage(String packageName, String destPath) throws RemoteException {
+    public void backupPackage(String packageName, String destPath) throws RemoteException {
         checkPermission();
-        if (mInProgress) {
-            Slog.w(TAG, "Operation already in progress");
+        if (packageName == null || packageName.isEmpty() || destPath == null || destPath.isEmpty()) {
+            Slog.w(TAG, "backupPackage: invalid args");
             return;
         }
-        mInProgress = true;
-        
-        new Thread(() -> {
-            try {
-                Slog.d(TAG, "Starting backup for " + packageName + " to " + destPath);
-                File pkgDir = resolvePackageBackupDir(destPath, packageName);
-                if (!ensureDirs(pkgDir)) {
-                    Slog.e(TAG, "Could not create backup directory: " + pkgDir);
-                    return;
-                }
-
-                BackupParts parts = new BackupParts();
-
-                // APK
-                File apkZip = new File(new File(pkgDir, DIR_APK), ZIP_APK);
-                parts.apk = zipApk(packageName, apkZip);
-
-                // Internal data
-                File ceZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER);
-                parts.userCe = zipDirIfExists(new File(CE_BASE, packageName), ceZip);
-
-                File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
-                parts.userDe = zipDirIfExists(new File(DE_BASE, packageName), deZip);
-
-                // External data
-                File extZip = new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA);
-                parts.extData = zipDirIfExists(new File(EXT_DATA_BASE, packageName), extZip);
-
-                // Additional
-                File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
-                parts.obb = zipDirIfExists(new File(OBB_BASE, packageName), obbZip);
-
-                File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
-                parts.media = zipDirIfExists(new File(MEDIA_BASE, packageName), mediaZip);
-
-                writeConfig(new File(pkgDir, FILE_CONFIG), packageName, parts);
-
-                Slog.i(TAG, "Backup finished successfully for " + packageName);
-            } catch (Exception e) {
-                Slog.e(TAG, "Backup failed for " + packageName, e);
-            } finally {
-                synchronized (this) {
-                    mInProgress = false;
-                }
-            }
-        }).start();
+        mWorkInFlight.incrementAndGet();
+        try {
+            mOperationQueue.put(new QueuedOperation(false, packageName, destPath));
+        } catch (InterruptedException e) {
+            mWorkInFlight.decrementAndGet();
+            Thread.currentThread().interrupt();
+            throw new RemoteException("Interrupted while queueing backup");
+        }
+        ensureWorker();
     }
 
     @Override
-    public synchronized void restorePackage(String packageName, String sourcePath) throws RemoteException {
+    public void restorePackage(String packageName, String sourcePath) throws RemoteException {
         checkPermission();
-        if (mInProgress) {
-            Slog.w(TAG, "Operation already in progress");
+        if (packageName == null || packageName.isEmpty() || sourcePath == null || sourcePath.isEmpty()) {
+            Slog.w(TAG, "restorePackage: invalid args");
             return;
         }
-        mInProgress = true;
+        mWorkInFlight.incrementAndGet();
+        try {
+            mOperationQueue.put(new QueuedOperation(true, packageName, sourcePath));
+        } catch (InterruptedException e) {
+            mWorkInFlight.decrementAndGet();
+            Thread.currentThread().interrupt();
+            throw new RemoteException("Interrupted while queueing restore");
+        }
+        ensureWorker();
+    }
 
-        new Thread(() -> {
+    private synchronized void ensureWorker() {
+        if (mWorkerRunning) {
+            return;
+        }
+        mWorkerRunning = true;
+        new Thread(this::runOperationWorker, "TrueBackupWorker").start();
+    }
+
+    private void runOperationWorker() {
+        while (true) {
+            QueuedOperation op;
             try {
-                Slog.d(TAG, "Starting restore for " + packageName + " from " + sourcePath);
-                File pkgDir = resolvePackageBackupDir(sourcePath, packageName);
-                File legacyDir = new File(sourcePath, packageName + "_data");
-
-                if (pkgDir.exists()) {
-                    restoreFromPackageDir(packageName, pkgDir);
-                } else if (legacyDir.exists()) {
-                    File dataDir = new File("/data/data/" + packageName);
-                    recursiveCopy(legacyDir, dataDir);
-                    if (isPackageInstalled(packageName)) {
-                        try {
-                            int appUid = getApplicationUidOrThrow(packageName);
-                            fixupRestoredTree(dataDir, appUid, appUid);
-                        } catch (IOException e) {
-                            Slog.w(TAG, "Legacy restore: could not fix ownership for " + packageName, e);
-                        }
-                    }
-                    File cfgDir = resolvePackageBackupDir(sourcePath, packageName);
-                    if (cfgDir != null && new File(cfgDir, FILE_CONFIG).isFile()) {
-                        applySecurityRestoreFromConfig(packageName, cfgDir);
-                    }
+                op = mOperationQueue.take();
+            } catch (InterruptedException e) {
+                Slog.w(TAG, "operation worker interrupted", e);
+                synchronized (this) {
+                    mWorkerRunning = false;
+                }
+                break;
+            }
+            synchronized (this) {
+                mActiveOperationKind = op.restore ? "restore" : "backup";
+                mActiveOperationPackage = op.packageName;
+            }
+            try {
+                if (op.restore) {
+                    executeRestore(op.packageName, op.path);
                 } else {
-                    Slog.e(TAG, "Source data not found at " + sourcePath);
-                    return;
+                    executeBackup(op.packageName, op.path);
                 }
-                
-                Slog.i(TAG, "Restore finished successfully for " + packageName);
             } catch (Exception e) {
-                Slog.e(TAG, "Restore failed for " + packageName, e);
+                Slog.e(TAG, "Queued operation failed", e);
             } finally {
                 synchronized (this) {
-                    mInProgress = false;
+                    mActiveOperationKind = null;
+                    mActiveOperationPackage = null;
                 }
+                mWorkInFlight.decrementAndGet();
             }
-        }).start();
+        }
+    }
+
+    private void executeBackup(String packageName, String destPath) {
+        try {
+            Slog.d(TAG, "Starting backup for " + packageName + " to " + destPath);
+            File pkgDir = resolvePackageBackupDir(destPath, packageName);
+            if (!ensureDirs(pkgDir)) {
+                Slog.e(TAG, "Could not create backup directory: " + pkgDir);
+                return;
+            }
+
+            BackupParts parts = new BackupParts();
+
+            // APK
+            File apkZip = new File(new File(pkgDir, DIR_APK), ZIP_APK);
+            parts.apk = zipApk(packageName, apkZip);
+
+            // Internal data
+            File ceZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER);
+            parts.userCe = zipDirIfExists(new File(CE_BASE, packageName), ceZip);
+
+            File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
+            parts.userDe = zipDirIfExists(new File(DE_BASE, packageName), deZip);
+
+            // External data
+            File extZip = new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA);
+            parts.extData = zipDirIfExists(new File(EXT_DATA_BASE, packageName), extZip);
+
+            // Additional
+            File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
+            parts.obb = zipDirIfExists(new File(OBB_BASE, packageName), obbZip);
+
+            File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
+            parts.media = zipDirIfExists(new File(MEDIA_BASE, packageName), mediaZip);
+
+            writeConfig(new File(pkgDir, FILE_CONFIG), packageName, parts);
+
+            Slog.i(TAG, "Backup finished successfully for " + packageName);
+        } catch (Exception e) {
+            Slog.e(TAG, "Backup failed for " + packageName, e);
+        }
+    }
+
+    private void executeRestore(String packageName, String sourcePath) {
+        try {
+            Slog.d(TAG, "Starting restore for " + packageName + " from " + sourcePath);
+            File pkgDir = resolvePackageBackupDir(sourcePath, packageName);
+            File legacyDir = new File(sourcePath, packageName + "_data");
+
+            if (pkgDir.exists()) {
+                restoreFromPackageDir(packageName, pkgDir);
+            } else if (legacyDir.exists()) {
+                File dataDir = new File("/data/data/" + packageName);
+                recursiveCopy(legacyDir, dataDir);
+                if (isPackageInstalled(packageName)) {
+                    try {
+                        int appUid = getApplicationUidOrThrow(packageName);
+                        fixupRestoredTree(dataDir, appUid, appUid);
+                    } catch (IOException e) {
+                        Slog.w(TAG, "Legacy restore: could not fix ownership for " + packageName, e);
+                    }
+                }
+                File cfgDir = resolvePackageBackupDir(sourcePath, packageName);
+                if (cfgDir != null && new File(cfgDir, FILE_CONFIG).isFile()) {
+                    applySecurityRestoreFromConfig(packageName, cfgDir);
+                }
+            } else {
+                Slog.e(TAG, "Source data not found at " + sourcePath);
+                return;
+            }
+
+            Slog.i(TAG, "Restore finished successfully for " + packageName);
+        } catch (Exception e) {
+            Slog.e(TAG, "Restore failed for " + packageName, e);
+        }
     }
 
     @Override
-    public synchronized boolean isOperationInProgress() {
-        return mInProgress;
+    public boolean isOperationInProgress() {
+        return mWorkInFlight.get() > 0;
+    }
+
+    @Override
+    public String getActiveOperationKind() {
+        checkPermission();
+        synchronized (this) {
+            return mActiveOperationKind;
+        }
+    }
+
+    @Override
+    public String getActiveOperationPackage() {
+        checkPermission();
+        synchronized (this) {
+            return mActiveOperationPackage;
+        }
+    }
+
+    @Override
+    public int getQueuedOperationCount() {
+        checkPermission();
+        return mOperationQueue.size();
     }
 
     @Override
