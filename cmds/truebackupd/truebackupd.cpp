@@ -50,6 +50,8 @@ enum Transaction : uint32_t {
     WRITE_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 5,
     /** Recursive chown + selinux_android_restorecon (matches backup tools that fix ownership after extract). */
     CHOWN_AND_RESTORECON = android::IBinder::FIRST_CALL_TRANSACTION + 6,
+    /** Recursively delete a directory tree (backup package folder under …/apps/…). */
+    DELETE_TREE = android::IBinder::FIRST_CALL_TRANSACTION + 7,
 };
 
 static std::string Dirname(const std::string& path) {
@@ -67,6 +69,7 @@ static bool UnzipToDir(const std::string& zipPath, const std::string& outDir);
 static bool IsPathTraversal(const std::string& entryName);
 static bool ChownRecursive(const std::string& path, uid_t uid, gid_t gid);
 static bool FixupOwnershipAndSelinux(const std::string& path, int32_t uid, int32_t gid);
+static bool RemoveTree(const std::string& path);
 
 static bool WriteFileAtomic(const std::string& outPath, const uint8_t* data, size_t dataLen) {
     std::string outParent = Dirname(outPath);
@@ -501,6 +504,62 @@ static bool FixupOwnershipAndSelinux(const std::string& path, int32_t uid32, int
     return true;
 }
 
+static bool RemoveTree(const std::string& path) {
+    if (path.empty() || path[0] != '/') {
+        LOG(ERROR) << "RemoveTree: invalid path: " << path;
+        return false;
+    }
+    if (path == "/" || path == "/data" || path == "/system" || path == "/vendor") {
+        LOG(ERROR) << "RemoveTree: refusing dangerous path: " << path;
+        return false;
+    }
+    if (path.find("/apps/") == std::string::npos) {
+        LOG(ERROR) << "RemoveTree: path must contain /apps/: " << path;
+        return false;
+    }
+
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0) {
+        if (errno == ENOENT) return true;
+        PLOG(ERROR) << "RemoveTree lstat: " << path;
+        return false;
+    }
+
+    if (S_ISLNK(st.st_mode)) {
+        return unlink(path.c_str()) == 0 || errno == ENOENT;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        DIR* dir = opendir(path.c_str());
+        if (!dir) {
+            PLOG(ERROR) << "RemoveTree opendir: " << path;
+            return false;
+        }
+        dirent* de;
+        bool ok = true;
+        while ((de = readdir(dir)) != nullptr) {
+            if (IsDotOrDotDot(de->d_name)) continue;
+            std::string child = path + "/" + de->d_name;
+            if (!RemoveTree(child)) {
+                ok = false;
+            }
+        }
+        closedir(dir);
+        if (!ok) return false;
+        if (rmdir(path.c_str()) != 0 && errno != ENOENT) {
+            PLOG(ERROR) << "RemoveTree rmdir: " << path;
+            return false;
+        }
+        return true;
+    }
+
+    if (unlink(path.c_str()) != 0 && errno != ENOENT) {
+        PLOG(ERROR) << "RemoveTree unlink: " << path;
+        return false;
+    }
+    return true;
+}
+
 class TrueBackupDaemonService : public android::BBinder {
   public:
     android::status_t onTransact(uint32_t code, const android::Parcel& data,
@@ -601,6 +660,12 @@ class TrueBackupDaemonService : public android::BBinder {
                     return android::NO_ERROR;
                 }
                 bool ok = FixupOwnershipAndSelinux(p, uid, gid);
+                reply->writeInt32(ok ? 0 : -1);
+                return android::NO_ERROR;
+            }
+            case DELETE_TREE: {
+                std::string p = std::string(android::String8(data.readString16()).c_str());
+                bool ok = RemoveTree(p);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }

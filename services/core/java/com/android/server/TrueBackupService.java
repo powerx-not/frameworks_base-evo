@@ -11,6 +11,7 @@ import android.content.pm.PermissionInfo;
 import android.os.Environment;
 import android.os.IBinder;
 import android.os.ITrueBackupService;
+import android.os.Parcel;
 import android.os.RemoteException;
 import android.os.SELinux;
 import android.os.ServiceManager;
@@ -59,6 +60,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final int TRUEBACKUPD_ZIP_MULTI_FILE = IBinder.FIRST_CALL_TRANSACTION + 4;
     private static final int TRUEBACKUPD_WRITE_FILE = IBinder.FIRST_CALL_TRANSACTION + 5;
     private static final int TRUEBACKUPD_CHOWN_AND_RESTORECON = IBinder.FIRST_CALL_TRANSACTION + 6;
+    private static final int TRUEBACKUPD_DELETE_TREE = IBinder.FIRST_CALL_TRANSACTION + 7;
 
     private static final String FILE_CONFIG = "package_restore_config.json";
 
@@ -245,6 +247,171 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
 
         return out.toArray(new String[0]);
+    }
+
+    /**
+     * Finds an existing per-app backup directory under {@code basePath} that contains
+     * {@link #FILE_CONFIG} and matches {@code packageName} (folder name or packageName in JSON).
+     */
+    private File findBackupDirWithMetadata(String basePath, String packageName) {
+        if (basePath == null || packageName == null || packageName.isEmpty()) {
+            return null;
+        }
+        File appsDir = resolveAppsDir(basePath);
+        if (appsDir == null) {
+            return null;
+        }
+        File direct = new File(appsDir, packageName);
+        if (new File(direct, FILE_CONFIG).isFile()) {
+            return direct;
+        }
+        File[] pkgDirs = appsDir.listFiles();
+        if (pkgDirs == null) {
+            return null;
+        }
+        for (File pkgDir : pkgDirs) {
+            if (pkgDir == null || !pkgDir.isDirectory()) {
+                continue;
+            }
+            File config = new File(pkgDir, FILE_CONFIG);
+            if (!config.isFile()) {
+                continue;
+            }
+            String pkg = pkgDir.getName();
+            try {
+                String json = new String(readFully(config), StandardCharsets.UTF_8);
+                JSONObject root = new JSONObject(json);
+                JSONObject pkgInfo = root.optJSONObject("packageInfo");
+                if (pkgInfo != null) {
+                    String pkgFromJson = pkgInfo.optString("packageName", null);
+                    if (pkgFromJson != null && !pkgFromJson.isEmpty()) {
+                        pkg = pkgFromJson;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            if (packageName.equals(pkg)) {
+                return pkgDir;
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public String resolveBackupPackageDir(String basePath, String packageName) throws RemoteException {
+        checkPermission();
+        File d = findBackupDirWithMetadata(basePath, packageName);
+        return d != null ? d.getAbsolutePath() : null;
+    }
+
+    @Override
+    public String readBackupMetadataJson(String basePath, String packageName) throws RemoteException {
+        checkPermission();
+        File dir = findBackupDirWithMetadata(basePath, packageName);
+        if (dir == null) {
+            return null;
+        }
+        File config = new File(dir, FILE_CONFIG);
+        try {
+            return new String(readFully(config), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            Slog.w(TAG, "readBackupMetadataJson", e);
+            return null;
+        }
+    }
+
+    @Override
+    public boolean deleteBackupPackage(String basePath, String packageName) throws RemoteException {
+        checkPermission();
+        if (basePath == null || packageName == null || packageName.isEmpty()) {
+            return false;
+        }
+        File dir = findBackupDirWithMetadata(basePath, packageName);
+        if (dir == null || !dir.isDirectory()) {
+            Slog.w(TAG, "deleteBackupPackage: no directory for " + packageName);
+            return false;
+        }
+        return deletePackageDirInternal(dir);
+    }
+
+    @Override
+    public boolean deleteBackupPackageAtPath(String basePath, String absolutePackageDir)
+            throws RemoteException {
+        checkPermission();
+        if (basePath == null || absolutePackageDir == null || absolutePackageDir.isEmpty()) {
+            return false;
+        }
+        if (!absolutePackageDir.startsWith("/") || !absolutePackageDir.contains("/apps/")) {
+            return false;
+        }
+        try {
+            File target = new File(absolutePackageDir).getCanonicalFile();
+            if (!target.isDirectory()) {
+                return false;
+            }
+            String tp = target.getPath();
+            File appsRoot = resolveAppsDir(basePath);
+            if (appsRoot != null) {
+                File root = appsRoot.getCanonicalFile();
+                String rp = root.getPath();
+                if (tp.equals(rp)) {
+                    Slog.w(TAG, "deleteBackupPackageAtPath: refusing apps root");
+                    return false;
+                }
+                if (!tp.startsWith(rp + File.separator)) {
+                    Slog.w(TAG, "deleteBackupPackageAtPath: path outside apps root");
+                    return false;
+                }
+            } else {
+                File base = new File(basePath).getCanonicalFile();
+                String bp = base.getPath();
+                if (!tp.startsWith(bp + File.separator) && !tp.equals(bp)) {
+                    Slog.w(TAG, "deleteBackupPackageAtPath: path outside backup base");
+                    return false;
+                }
+            }
+            return deletePackageDirInternal(target);
+        } catch (IOException e) {
+            Slog.w(TAG, "deleteBackupPackageAtPath", e);
+            return false;
+        }
+    }
+
+    private boolean deletePackageDirInternal(File dir) {
+        if (dir == null) {
+            return false;
+        }
+        String abs = dir.getAbsolutePath();
+        if (deleteTreeWithDaemon(abs)) {
+            return true;
+        }
+        Slog.w(TAG, "deleteTreeWithDaemon failed; fallback recursiveDelete for " + abs);
+        recursiveDelete(dir);
+        return !dir.exists();
+    }
+
+    private boolean deleteTreeWithDaemon(String absPath) {
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null) {
+            return false;
+        }
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            data.writeString16(absPath);
+            boolean ok = daemon.transact(TRUEBACKUPD_DELETE_TREE, data, reply, 0);
+            if (!ok) {
+                return false;
+            }
+            return reply.readInt() == 0;
+        } catch (RemoteException e) {
+            Slog.w(TAG, "deleteTreeWithDaemon", e);
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
     }
 
     private void checkPermission() {
