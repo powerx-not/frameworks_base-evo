@@ -51,13 +51,17 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final String TAG = "TrueBackupService";
     private final Context mContext;
 
+    private static final int OP_BACKUP = 0;
+    private static final int OP_RESTORE = 1;
+    private static final int OP_DELETE = 2;
+
     private static final class QueuedOperation {
-        final boolean restore;
+        final int type;
         final String packageName;
         final String path;
 
-        QueuedOperation(boolean restore, String packageName, String path) {
-            this.restore = restore;
+        QueuedOperation(int type, String packageName, String path) {
+            this.type = type;
             this.packageName = packageName;
             this.path = path;
         }
@@ -127,7 +131,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
         mWorkInFlight.incrementAndGet();
         try {
-            mOperationQueue.put(new QueuedOperation(false, packageName, destPath));
+            mOperationQueue.put(new QueuedOperation(OP_BACKUP, packageName, destPath));
         } catch (InterruptedException e) {
             mWorkInFlight.decrementAndGet();
             Thread.currentThread().interrupt();
@@ -145,11 +149,29 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
         mWorkInFlight.incrementAndGet();
         try {
-            mOperationQueue.put(new QueuedOperation(true, packageName, sourcePath));
+            mOperationQueue.put(new QueuedOperation(OP_RESTORE, packageName, sourcePath));
         } catch (InterruptedException e) {
             mWorkInFlight.decrementAndGet();
             Thread.currentThread().interrupt();
             throw new RemoteException("Interrupted while queueing restore");
+        }
+        ensureWorker();
+    }
+
+    @Override
+    public void enqueueDeleteBackupPackage(String basePath, String packageName) throws RemoteException {
+        checkPermission();
+        if (basePath == null || basePath.isEmpty() || packageName == null || packageName.isEmpty()) {
+            Slog.w(TAG, "enqueueDeleteBackupPackage: invalid args");
+            return;
+        }
+        mWorkInFlight.incrementAndGet();
+        try {
+            mOperationQueue.put(new QueuedOperation(OP_DELETE, packageName, basePath));
+        } catch (InterruptedException e) {
+            mWorkInFlight.decrementAndGet();
+            Thread.currentThread().interrupt();
+            throw new RemoteException("Interrupted while queueing delete");
         }
         ensureWorker();
     }
@@ -175,14 +197,30 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                 break;
             }
             synchronized (this) {
-                mActiveOperationKind = op.restore ? "restore" : "backup";
+                switch (op.type) {
+                    case OP_RESTORE:
+                        mActiveOperationKind = "restore";
+                        break;
+                    case OP_DELETE:
+                        mActiveOperationKind = "delete";
+                        break;
+                    default:
+                        mActiveOperationKind = "backup";
+                        break;
+                }
                 mActiveOperationPackage = op.packageName;
             }
             try {
-                if (op.restore) {
-                    executeRestore(op.packageName, op.path);
-                } else {
-                    executeBackup(op.packageName, op.path);
+                switch (op.type) {
+                    case OP_RESTORE:
+                        executeRestore(op.packageName, op.path);
+                        break;
+                    case OP_DELETE:
+                        executeDeleteBackup(op.path, op.packageName);
+                        break;
+                    default:
+                        executeBackup(op.packageName, op.path);
+                        break;
                 }
             } catch (Exception e) {
                 Slog.e(TAG, "Queued operation failed", e);
@@ -268,6 +306,105 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             Slog.i(TAG, "Restore finished successfully for " + packageName);
         } catch (Exception e) {
             Slog.e(TAG, "Restore failed for " + packageName, e);
+        }
+    }
+
+    private void executeDeleteBackup(String basePath, String packageName) {
+        try {
+            Slog.d(TAG, "Starting delete backup for " + packageName);
+            if (deleteBackupPackageInternal(basePath, packageName)) {
+                Slog.i(TAG, "Delete finished (primary) for " + packageName);
+                return;
+            }
+            String json = readBackupMetadataJsonInternal(basePath, packageName);
+            if (json != null && !json.isEmpty()) {
+                try {
+                    JSONObject root = new JSONObject(json);
+                    JSONObject bc = root.optJSONObject("backupConfig");
+                    String sp = bc != null ? bc.optString("storagePath", null) : null;
+                    if (sp != null) {
+                        String tsp = sp.trim();
+                        if (!tsp.isEmpty() && deleteBackupPackageAtPathInternal(basePath, tsp)) {
+                            Slog.i(TAG, "Delete finished (storagePath) for " + packageName);
+                            return;
+                        }
+                    }
+                } catch (Exception e) {
+                    Slog.w(TAG, "delete metadata path", e);
+                }
+            }
+            if (deleteBackupPackageInternal(basePath, packageName)) {
+                Slog.i(TAG, "Delete finished (retry) for " + packageName);
+            } else {
+                Slog.w(TAG, "Delete failed for " + packageName);
+            }
+        } catch (Exception e) {
+            Slog.e(TAG, "executeDeleteBackup", e);
+        }
+    }
+
+    private String readBackupMetadataJsonInternal(String basePath, String packageName) {
+        File dir = findBackupDirWithMetadata(basePath, packageName);
+        if (dir == null) {
+            return null;
+        }
+        File config = new File(dir, FILE_CONFIG);
+        try {
+            return new String(readFully(config), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            Slog.w(TAG, "readBackupMetadataJsonInternal", e);
+            return null;
+        }
+    }
+
+    private boolean deleteBackupPackageInternal(String basePath, String packageName) {
+        if (basePath == null || packageName == null || packageName.isEmpty()) {
+            return false;
+        }
+        File dir = findBackupDirWithMetadata(basePath, packageName);
+        if (dir == null || !dir.isDirectory()) {
+            return false;
+        }
+        return deletePackageDirInternal(dir);
+    }
+
+    private boolean deleteBackupPackageAtPathInternal(String basePath, String absolutePackageDir) {
+        if (basePath == null || absolutePackageDir == null || absolutePackageDir.isEmpty()) {
+            return false;
+        }
+        if (!absolutePackageDir.startsWith("/") || !absolutePackageDir.contains("/apps/")) {
+            return false;
+        }
+        try {
+            File target = new File(absolutePackageDir).getCanonicalFile();
+            if (!target.isDirectory()) {
+                return false;
+            }
+            String tp = target.getPath();
+            File appsRoot = resolveAppsDir(basePath);
+            if (appsRoot != null) {
+                File root = appsRoot.getCanonicalFile();
+                String rp = root.getPath();
+                if (tp.equals(rp)) {
+                    Slog.w(TAG, "deleteBackupPackageAtPathInternal: refusing apps root");
+                    return false;
+                }
+                if (!tp.startsWith(rp + File.separator)) {
+                    Slog.w(TAG, "deleteBackupPackageAtPathInternal: path outside apps root");
+                    return false;
+                }
+            } else {
+                File base = new File(basePath).getCanonicalFile();
+                String bp = base.getPath();
+                if (!tp.startsWith(bp + File.separator) && !tp.equals(bp)) {
+                    Slog.w(TAG, "deleteBackupPackageAtPathInternal: path outside backup base");
+                    return false;
+                }
+            }
+            return deletePackageDirInternal(target);
+        } catch (IOException e) {
+            Slog.w(TAG, "deleteBackupPackageAtPathInternal", e);
+            return false;
         }
     }
 
@@ -397,17 +534,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     @Override
     public String readBackupMetadataJson(String basePath, String packageName) throws RemoteException {
         checkPermission();
-        File dir = findBackupDirWithMetadata(basePath, packageName);
-        if (dir == null) {
-            return null;
-        }
-        File config = new File(dir, FILE_CONFIG);
-        try {
-            return new String(readFully(config), StandardCharsets.UTF_8);
-        } catch (IOException e) {
-            Slog.w(TAG, "readBackupMetadataJson", e);
-            return null;
-        }
+        return readBackupMetadataJsonInternal(basePath, packageName);
     }
 
     @Override
@@ -421,50 +548,14 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             Slog.w(TAG, "deleteBackupPackage: no directory for " + packageName);
             return false;
         }
-        return deletePackageDirInternal(dir);
+        return deleteBackupPackageInternal(basePath, packageName);
     }
 
     @Override
     public boolean deleteBackupPackageAtPath(String basePath, String absolutePackageDir)
             throws RemoteException {
         checkPermission();
-        if (basePath == null || absolutePackageDir == null || absolutePackageDir.isEmpty()) {
-            return false;
-        }
-        if (!absolutePackageDir.startsWith("/") || !absolutePackageDir.contains("/apps/")) {
-            return false;
-        }
-        try {
-            File target = new File(absolutePackageDir).getCanonicalFile();
-            if (!target.isDirectory()) {
-                return false;
-            }
-            String tp = target.getPath();
-            File appsRoot = resolveAppsDir(basePath);
-            if (appsRoot != null) {
-                File root = appsRoot.getCanonicalFile();
-                String rp = root.getPath();
-                if (tp.equals(rp)) {
-                    Slog.w(TAG, "deleteBackupPackageAtPath: refusing apps root");
-                    return false;
-                }
-                if (!tp.startsWith(rp + File.separator)) {
-                    Slog.w(TAG, "deleteBackupPackageAtPath: path outside apps root");
-                    return false;
-                }
-            } else {
-                File base = new File(basePath).getCanonicalFile();
-                String bp = base.getPath();
-                if (!tp.startsWith(bp + File.separator) && !tp.equals(bp)) {
-                    Slog.w(TAG, "deleteBackupPackageAtPath: path outside backup base");
-                    return false;
-                }
-            }
-            return deletePackageDirInternal(target);
-        } catch (IOException e) {
-            Slog.w(TAG, "deleteBackupPackageAtPath", e);
-            return false;
-        }
+        return deleteBackupPackageAtPathInternal(basePath, absolutePackageDir);
     }
 
     private boolean deletePackageDirInternal(File dir) {
