@@ -7,10 +7,22 @@ interface ITrueBackupService {
 
     /** Queue deleting one app backup (same worker as backup/restore). */
     void enqueueDeleteBackupPackage(String basePath, String packageName);
+
+    /** Returns true if a registration password is set. */
+    boolean isRegistrationPasswordSet();
+
+    /** Sets (or replaces) the registration password and re-encrypts existing backups. */
+    boolean setRegistrationPassword(String newPassword);
+
+    /** Changes the registration password (requires old password) and re-encrypts existing backups. */
+    boolean changeRegistrationPassword(String oldPassword, String newPassword);
+
+    /** Resets the registration password and re-encrypts existing backups. */
+    boolean resetRegistrationPassword(String newPassword);
     String[] listBackedUpApps(String basePath);
     boolean isOperationInProgress();
 
-    /** {@code "backup"}, {@code "restore"}, or {@code "delete"} while a job runs; null when idle. */
+    /** {@code "backup"}, {@code "restore"}, {@code "delete"}, or {@code "rekey"} while a job runs; null when idle. */
     String getActiveOperationKind();
 
     /** Package name of the job currently executing; null when idle. */
