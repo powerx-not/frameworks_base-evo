@@ -1566,24 +1566,27 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         if (extZip != null) {
             File target = new File(EXT_DATA_BASE, packageName);
             unzipToDirMaybeDaemon(extZip, target);
+            int extUid = statDirUidOrFallback(EXT_DATA_GID_REF, appUid, "uid");
             int extGid = statDirGidOrUid(EXT_DATA_GID_REF, appUid);
-            fixupRestoredTree(target, appUid, extGid);
+            fixupRestoredTree(target, extUid, extGid);
         }
 
         File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
         if (obbZip.exists()) {
             File target = new File(OBB_BASE, packageName);
             unzipToDirMaybeDaemon(obbZip, target);
+            int obbUid = statDirUidOrFallback(OBB_GID_REF, appUid, "uid");
             int obbGid = statDirGidOrUid(OBB_GID_REF, appUid);
-            fixupRestoredTree(target, appUid, obbGid);
+            fixupRestoredTree(target, obbUid, obbGid);
         }
 
         File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
         if (mediaZip.exists()) {
             File target = new File(MEDIA_BASE, packageName);
             unzipToDirMaybeDaemon(mediaZip, target);
+            int mediaUid = statDirUidOrFallback(MEDIA_GID_REF, appUid, "uid");
             int mediaGid = statDirGidOrUid(MEDIA_GID_REF, appUid);
-            fixupRestoredTree(target, appUid, mediaGid);
+            fixupRestoredTree(target, mediaUid, mediaGid);
         }
 
         applySecurityRestoreFromConfig(packageName, pkgDir);
@@ -1604,6 +1607,15 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         } catch (ErrnoException e) {
             Slog.w(TAG, "stat failed for " + dirPath + "; using app uid as gid", e);
             return uidFallback;
+        }
+    }
+
+    private static int statDirUidOrFallback(String dirPath, int fallback, String label) {
+        try {
+            return (int) Os.stat(dirPath).st_uid;
+        } catch (ErrnoException e) {
+            Slog.w(TAG, "stat failed for " + dirPath + "; using fallback as " + label, e);
+            return fallback;
         }
     }
 
