@@ -61,9 +61,9 @@ enum Transaction : uint32_t {
     SET_PASSWORD = android::IBinder::FIRST_CALL_TRANSACTION + 8,
     /** Read TrueBackup registration password (fixed location under /data/system/truebackup). */
     GET_PASSWORD = android::IBinder::FIRST_CALL_TRANSACTION + 9,
-    /** Encrypt a plain file in place (TBE1: PBKDF2 + AES-256-GCM, matches TrueBackupService format). */
+    /** Encrypt a plain file in place (TBK1 container with wrapped master key). */
     ENCRYPT_ZIP_IN_PLACE = android::IBinder::FIRST_CALL_TRANSACTION + 10,
-    /** Decrypt TBE1 file to a new path. */
+    /** Decrypt TBK1 file to a new path. */
     DECRYPT_ZIP_TO_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 11,
     /** Change registration password (requires old password). */
     CHANGE_PASSWORD = android::IBinder::FIRST_CALL_TRANSACTION + 12,
@@ -580,22 +580,46 @@ static bool FixupOwnershipAndSelinux(const std::string& path, int32_t uid32, int
     return true;
 }
 
-constexpr uint8_t kEncMagic[] = {'T', 'B', 'E', '1'};
+// TrueBackup container v1: wrapped master key in header + payload encrypted by master key.
+constexpr uint8_t kEncMagic[] = {'T', 'B', 'K', '1'};
 constexpr int kEncVersion = 1;
 constexpr size_t kEncSaltLen = 16;
-constexpr size_t kEncIvLen = 12;
+constexpr size_t kWrapIvLen = 12;
+constexpr size_t kPayloadIvLen = 12;
+constexpr size_t kMasterKeyLen = 32;
 constexpr int kEncPbkdf2Iters = 120000;
 constexpr size_t kGcmTagLen = 16;
+constexpr size_t kWrappedMasterLen = kMasterKeyLen + kGcmTagLen;
 
-static bool DeriveKey(const std::string& password, const uint8_t* salt, size_t saltLen, uint8_t outKey[32]) {
+static void WriteU32Be(FILE* out, uint32_t v) {
+    uint8_t b[4] = {
+        static_cast<uint8_t>((v >> 24) & 0xff),
+        static_cast<uint8_t>((v >> 16) & 0xff),
+        static_cast<uint8_t>((v >> 8) & 0xff),
+        static_cast<uint8_t>(v & 0xff),
+    };
+    fwrite(b, 1, sizeof(b), out);
+}
+
+static bool ReadU32Be(FILE* in, uint32_t* out) {
+    uint8_t b[4];
+    if (fread(b, 1, sizeof(b), in) != sizeof(b)) return false;
+    *out = (static_cast<uint32_t>(b[0]) << 24) | (static_cast<uint32_t>(b[1]) << 16) |
+           (static_cast<uint32_t>(b[2]) << 8) | static_cast<uint32_t>(b[3]);
+    return true;
+}
+
+static bool DeriveKey(const std::string& password, const uint8_t* salt, size_t saltLen, uint8_t outKey[32],
+                      uint32_t iterations = static_cast<uint32_t>(kEncPbkdf2Iters)) {
     // Matches Java PBKDF2WithHmacSHA256 (BoringSSL uses PKCS5_PBKDF2_HMAC + EVP_sha256).
     return PKCS5_PBKDF2_HMAC(reinterpret_cast<const char*>(password.data()), password.size(), salt, saltLen,
-                             static_cast<uint32_t>(kEncPbkdf2Iters), EVP_sha256(), 32, outKey) == 1;
+                             iterations, EVP_sha256(), 32, outKey) == 1;
 }
 
 /**
- * Encrypts a regular file in place to TBE1 format (same as Java TrueBackupService).
- * If the file already begins with TBE1 magic, returns true without modifying it.
+ * Encrypts a regular file in place to TBK1:
+ * [magic|version|iterations|salt|wrap_iv|payload_iv|wrapped_master|encrypted_payload|payload_tag]
+ * If file already starts with TBK1, returns true.
  */
 static bool EncryptZipInPlace(const std::string& path, const std::string& password) {
     if (path.empty() || path[0] != '/' || password.empty()) {
@@ -638,36 +662,95 @@ static bool EncryptZipInPlace(const std::string& path, const std::string& passwo
     }
 
     uint8_t salt[kEncSaltLen];
-    uint8_t iv[kEncIvLen];
-    if (RAND_bytes(salt, sizeof(salt)) != 1 || RAND_bytes(iv, sizeof(iv)) != 1) {
+    uint8_t wrapIv[kWrapIvLen];
+    uint8_t payloadIv[kPayloadIvLen];
+    uint8_t masterKey[kMasterKeyLen];
+    if (RAND_bytes(salt, sizeof(salt)) != 1 || RAND_bytes(wrapIv, sizeof(wrapIv)) != 1 ||
+        RAND_bytes(payloadIv, sizeof(payloadIv)) != 1 || RAND_bytes(masterKey, sizeof(masterKey)) != 1) {
         fclose(in);
         fclose(out);
         unlink(tmpPath.c_str());
         return false;
     }
 
-    uint8_t key[32];
-    if (!DeriveKey(password, salt, sizeof(salt), key)) {
-        OPENSSL_cleanse(key, sizeof(key));
+    uint8_t unlockKey[32];
+    if (!DeriveKey(password, salt, sizeof(salt), unlockKey)) {
+        OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
+        OPENSSL_cleanse(masterKey, sizeof(masterKey));
         fclose(in);
         fclose(out);
         unlink(tmpPath.c_str());
         return false;
     }
 
-    if (fwrite(kEncMagic, 1, 4, out) != 4 || fputc(kEncVersion, out) == EOF ||
-        fputc(static_cast<int>(kEncSaltLen), out) == EOF || fputc(static_cast<int>(kEncIvLen), out) == EOF ||
-        fwrite(salt, 1, kEncSaltLen, out) != kEncSaltLen || fwrite(iv, 1, kEncIvLen, out) != kEncIvLen) {
-        OPENSSL_cleanse(key, sizeof(key));
+    uint8_t wrappedMaster[kWrappedMasterLen];
+    {
+        EVP_CIPHER_CTX* wrapCtx = EVP_CIPHER_CTX_new();
+        if (!wrapCtx) {
+            OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
+            OPENSSL_cleanse(masterKey, sizeof(masterKey));
+            fclose(in);
+            fclose(out);
+            unlink(tmpPath.c_str());
+            return false;
+        }
+        bool wrapOk = false;
+        do {
+            if (EVP_EncryptInit_ex(wrapCtx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
+            if (EVP_CIPHER_CTX_ctrl(wrapCtx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kWrapIvLen), nullptr) != 1) {
+                break;
+            }
+            if (EVP_EncryptInit_ex(wrapCtx, nullptr, nullptr, unlockKey, wrapIv) != 1) break;
+            int outLen = 0;
+            if (EVP_EncryptUpdate(wrapCtx, wrappedMaster, &outLen, masterKey, static_cast<int>(kMasterKeyLen)) != 1) {
+                break;
+            }
+            if (outLen != static_cast<int>(kMasterKeyLen)) break;
+            int finalLen = 0;
+            if (EVP_EncryptFinal_ex(wrapCtx, wrappedMaster + outLen, &finalLen) != 1) break;
+            if (EVP_CIPHER_CTX_ctrl(wrapCtx, EVP_CTRL_GCM_GET_TAG, static_cast<int>(kGcmTagLen),
+                                    wrappedMaster + kMasterKeyLen) != 1) {
+                break;
+            }
+            wrapOk = true;
+        } while (false);
+        EVP_CIPHER_CTX_free(wrapCtx);
+        if (!wrapOk) {
+            OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
+            OPENSSL_cleanse(masterKey, sizeof(masterKey));
+            fclose(in);
+            fclose(out);
+            unlink(tmpPath.c_str());
+            return false;
+        }
+    }
+
+    if (fwrite(kEncMagic, 1, 4, out) != 4 || fputc(kEncVersion, out) == EOF) {
+        OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
+        OPENSSL_cleanse(masterKey, sizeof(masterKey));
         fclose(in);
         fclose(out);
         unlink(tmpPath.c_str());
         return false;
     }
+    WriteU32Be(out, static_cast<uint32_t>(kEncPbkdf2Iters));
+    if (fwrite(salt, 1, sizeof(salt), out) != sizeof(salt) || fwrite(wrapIv, 1, sizeof(wrapIv), out) != sizeof(wrapIv) ||
+        fwrite(payloadIv, 1, sizeof(payloadIv), out) != sizeof(payloadIv) ||
+        fwrite(wrappedMaster, 1, sizeof(wrappedMaster), out) != sizeof(wrappedMaster)) {
+        OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
+        OPENSSL_cleanse(masterKey, sizeof(masterKey));
+        OPENSSL_cleanse(wrappedMaster, sizeof(wrappedMaster));
+        fclose(in);
+        fclose(out);
+        unlink(tmpPath.c_str());
+        return false;
+    }
+    OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
+    OPENSSL_cleanse(wrappedMaster, sizeof(wrappedMaster));
 
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) {
-        OPENSSL_cleanse(key, sizeof(key));
+        OPENSSL_cleanse(masterKey, sizeof(masterKey));
         fclose(in);
         fclose(out);
         unlink(tmpPath.c_str());
@@ -677,8 +760,8 @@ static bool EncryptZipInPlace(const std::string& path, const std::string& passwo
     int ok = 0;
     do {
         if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kEncIvLen), nullptr) != 1) break;
-        if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, iv) != 1) break;
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kPayloadIvLen), nullptr) != 1) break;
+        if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, masterKey, payloadIv) != 1) break;
 
         uint8_t buf[64 * 1024];
         uint8_t outbuf[64 * 1024 + EVP_MAX_BLOCK_LENGTH];
@@ -710,7 +793,7 @@ static bool EncryptZipInPlace(const std::string& path, const std::string& passwo
     } while (false);
 
     EVP_CIPHER_CTX_free(ctx);
-    OPENSSL_cleanse(key, sizeof(key));
+    OPENSSL_cleanse(masterKey, sizeof(masterKey));
     fclose(in);
     fclose(out);
 
@@ -757,15 +840,18 @@ static bool DecryptZipToFile(const std::string& encPath, const std::string& outP
         fclose(in);
         return false;
     }
-    int saltLen = fgetc(in);
-    int ivLen = fgetc(in);
-    if (saltLen != static_cast<int>(kEncSaltLen) || ivLen != static_cast<int>(kEncIvLen)) {
+    uint32_t iterations = 0;
+    if (!ReadU32Be(in, &iterations) || iterations == 0) {
         fclose(in);
         return false;
     }
     uint8_t salt[kEncSaltLen];
-    uint8_t iv[kEncIvLen];
-    if (fread(salt, 1, kEncSaltLen, in) != kEncSaltLen || fread(iv, 1, kEncIvLen, in) != kEncIvLen) {
+    uint8_t wrapIv[kWrapIvLen];
+    uint8_t payloadIv[kPayloadIvLen];
+    uint8_t wrappedMaster[kWrappedMasterLen];
+    if (fread(salt, 1, sizeof(salt), in) != sizeof(salt) || fread(wrapIv, 1, sizeof(wrapIv), in) != sizeof(wrapIv) ||
+        fread(payloadIv, 1, sizeof(payloadIv), in) != sizeof(payloadIv) ||
+        fread(wrappedMaster, 1, sizeof(wrappedMaster), in) != sizeof(wrappedMaster)) {
         fclose(in);
         return false;
     }
@@ -800,18 +886,60 @@ static bool DecryptZipToFile(const std::string& encPath, const std::string& outP
         return false;
     }
 
-    uint8_t key[32];
-    if (!DeriveKey(password, salt, sizeof(salt), key)) {
-        OPENSSL_cleanse(key, sizeof(key));
+    uint8_t unlockKey[32];
+    if (!DeriveKey(password, salt, sizeof(salt), unlockKey, iterations)) {
+        OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
         fclose(in);
         fclose(out);
         unlink(outPath.c_str());
         return false;
     }
 
+    uint8_t masterKey[kMasterKeyLen];
+    {
+        EVP_CIPHER_CTX* unwrapCtx = EVP_CIPHER_CTX_new();
+        if (!unwrapCtx) {
+            OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
+            fclose(in);
+            fclose(out);
+            unlink(outPath.c_str());
+            return false;
+        }
+        bool unwrapOk = false;
+        do {
+            if (EVP_DecryptInit_ex(unwrapCtx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
+            if (EVP_CIPHER_CTX_ctrl(unwrapCtx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kWrapIvLen), nullptr) != 1) {
+                break;
+            }
+            if (EVP_DecryptInit_ex(unwrapCtx, nullptr, nullptr, unlockKey, wrapIv) != 1) break;
+            int outLen = 0;
+            if (EVP_DecryptUpdate(unwrapCtx, masterKey, &outLen, wrappedMaster, static_cast<int>(kMasterKeyLen)) != 1) {
+                break;
+            }
+            if (outLen != static_cast<int>(kMasterKeyLen)) break;
+            if (EVP_CIPHER_CTX_ctrl(unwrapCtx, EVP_CTRL_GCM_SET_TAG, static_cast<int>(kGcmTagLen),
+                                    wrappedMaster + kMasterKeyLen) != 1) {
+                break;
+            }
+            int finalLen = 0;
+            if (EVP_DecryptFinal_ex(unwrapCtx, masterKey + outLen, &finalLen) != 1) break;
+            unwrapOk = true;
+        } while (false);
+        EVP_CIPHER_CTX_free(unwrapCtx);
+        OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
+        OPENSSL_cleanse(wrappedMaster, sizeof(wrappedMaster));
+        if (!unwrapOk) {
+            OPENSSL_cleanse(masterKey, sizeof(masterKey));
+            fclose(in);
+            fclose(out);
+            unlink(outPath.c_str());
+            return false;
+        }
+    }
+
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) {
-        OPENSSL_cleanse(key, sizeof(key));
+        OPENSSL_cleanse(masterKey, sizeof(masterKey));
         fclose(in);
         fclose(out);
         unlink(outPath.c_str());
@@ -821,8 +949,8 @@ static bool DecryptZipToFile(const std::string& encPath, const std::string& outP
     bool fail = true;
     do {
         if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kEncIvLen), nullptr) != 1) break;
-        if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, iv) != 1) break;
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kPayloadIvLen), nullptr) != 1) break;
+        if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, masterKey, payloadIv) != 1) break;
 
         uint8_t buf[64 * 1024];
         uint8_t outbuf[64 * 1024 + EVP_MAX_BLOCK_LENGTH];
@@ -856,7 +984,7 @@ static bool DecryptZipToFile(const std::string& encPath, const std::string& outP
 
 decrypt_fail:
     EVP_CIPHER_CTX_free(ctx);
-    OPENSSL_cleanse(key, sizeof(key));
+    OPENSSL_cleanse(masterKey, sizeof(masterKey));
     fclose(in);
     fclose(out);
     if (fail) {

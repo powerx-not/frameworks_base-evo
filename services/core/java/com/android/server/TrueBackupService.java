@@ -149,8 +149,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     /** User id for CE/DE paths and permission restore (matches fixed CE_BASE user). */
     private static final int BACKUP_RESTORE_USER_ID = UserHandle.USER_SYSTEM;
 
-    /** TBE1 magic (format implemented in truebackupd). */
-    private static final byte[] ENC_MAGIC = new byte[] { 'T', 'B', 'E', '1' };
+    /** TBK1 magic (format implemented in truebackupd with wrapped master key header). */
+    private static final byte[] ENC_MAGIC = new byte[] { 'T', 'B', 'K', '1' };
     private static final String REG_PW_KEYSTORE = "AndroidKeyStore";
     private static final String REG_PW_KEY_ALIAS = "truebackup_registration_password_v1";
     private static final String REG_PW_BLOB_PREFIX = "tbpw1:";
@@ -1115,13 +1115,12 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             throw new IOException("App not installed and apk.zip missing: " + apkZip);
         }
 
-        // Encrypted backups store TBE1-wrapped bytes; decrypt via truebackupd before parsing as ZIP.
+        // Encrypted backups store TBK1-wrapped bytes; decrypt via truebackupd before parsing as ZIP.
         // Decrypted copy lives under /data/system/truebackup/tmp (system_server has no app cache dir).
         File zipToRead = apkZip;
         File tmpDecrypted = null;
         if (isEncryptedFile(apkZip)) {
-            File tmpDir = getTrueBackupTempDir();
-            tmpDecrypted = File.createTempFile("truebackup_apk_", ".zip", tmpDir);
+            tmpDecrypted = createTrueBackupWorkFile("truebackup_apk_", ".zip");
             String pw = readRegistrationPassword();
             if (pw == null) {
                 //noinspection ResultOfMethodCallIgnored
