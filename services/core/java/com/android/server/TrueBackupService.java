@@ -108,7 +108,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final int TRUEBACKUPD_ZIP_SINGLE_FILE = IBinder.FIRST_CALL_TRANSACTION + 3;
     private static final int TRUEBACKUPD_ZIP_MULTI_FILE = IBinder.FIRST_CALL_TRANSACTION + 4;
     private static final int TRUEBACKUPD_WRITE_FILE = IBinder.FIRST_CALL_TRANSACTION + 5;
-    private static final int TRUEBACKUPD_CHOWN_AND_RESTORECON = IBinder.FIRST_CALL_TRANSACTION + 6;
+    private static final int TRUEBACKUPD_CHOWN_AND_CHCON = IBinder.FIRST_CALL_TRANSACTION + 13;
     private static final int TRUEBACKUPD_DELETE_TREE = IBinder.FIRST_CALL_TRANSACTION + 7;
     private static final int TRUEBACKUPD_SET_PASSWORD = IBinder.FIRST_CALL_TRANSACTION + 8;
     private static final int TRUEBACKUPD_GET_PASSWORD = IBinder.FIRST_CALL_TRANSACTION + 9;
@@ -1566,27 +1566,24 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         if (extZip != null) {
             File target = new File(EXT_DATA_BASE, packageName);
             unzipToDirMaybeDaemon(extZip, target);
-            int extUid = statDirUidOrFallback(EXT_DATA_GID_REF, appUid, "uid");
             int extGid = statDirGidOrUid(EXT_DATA_GID_REF, appUid);
-            fixupRestoredTree(target, extUid, extGid);
+            fixupRestoredTree(target, appUid, extGid);
         }
 
         File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
         if (obbZip.exists()) {
             File target = new File(OBB_BASE, packageName);
             unzipToDirMaybeDaemon(obbZip, target);
-            int obbUid = statDirUidOrFallback(OBB_GID_REF, appUid, "uid");
             int obbGid = statDirGidOrUid(OBB_GID_REF, appUid);
-            fixupRestoredTree(target, obbUid, obbGid);
+            fixupRestoredTree(target, appUid, obbGid);
         }
 
         File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
         if (mediaZip.exists()) {
             File target = new File(MEDIA_BASE, packageName);
             unzipToDirMaybeDaemon(mediaZip, target);
-            int mediaUid = statDirUidOrFallback(MEDIA_GID_REF, appUid, "uid");
             int mediaGid = statDirGidOrUid(MEDIA_GID_REF, appUid);
-            fixupRestoredTree(target, mediaUid, mediaGid);
+            fixupRestoredTree(target, appUid, mediaGid);
         }
 
         applySecurityRestoreFromConfig(packageName, pkgDir);
@@ -1610,15 +1607,6 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private static int statDirUidOrFallback(String dirPath, int fallback, String label) {
-        try {
-            return (int) Os.stat(dirPath).st_uid;
-        } catch (ErrnoException e) {
-            Slog.w(TAG, "stat failed for " + dirPath + "; using fallback as " + label, e);
-            return fallback;
-        }
-    }
-
     /**
      * Extracted files are owned by root; relabel and chown so the app can run (same idea as
      * {@code PackagesRestoreUtil.restoreData} in Android-DataBackup).
@@ -1634,34 +1622,32 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             Slog.e(TAG, "fixup: bad path " + path, e);
             return;
         }
-        if (chownAndRestoreconWithDaemon(abs, uid, gid)) {
+        String ctx = SELinux.getFileContext(abs);
+        if (ctx != null && !ctx.isEmpty() && chownAndChconWithDaemon(abs, uid, gid, ctx)) {
             return;
         }
-        Slog.w(TAG, "truebackupd fixup failed for " + abs + "; trying SELinux.restoreconRecursive only");
+        Slog.w(TAG, "truebackupd chown/chcon failed for " + abs + "; trying SELinux.restoreconRecursive only");
         if (!SELinux.restoreconRecursive(path)) {
             Slog.e(TAG, "SELinux.restoreconRecursive failed for " + abs);
         }
     }
 
-    private boolean chownAndRestoreconWithDaemon(String absolutePath, int uid, int gid) {
+    private boolean chownAndChconWithDaemon(String absolutePath, int uid, int gid, String context) {
         IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
-        if (daemon == null) {
-            return false;
-        }
-        android.os.Parcel data = android.os.Parcel.obtain();
-        android.os.Parcel reply = android.os.Parcel.obtain();
+        if (daemon == null || context == null || context.isEmpty()) return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
         try {
             data.writeInt(TRUEBACKUPD_TOKEN);
             data.writeString16(absolutePath);
             data.writeInt(uid);
             data.writeInt(gid);
-            boolean ok = daemon.transact(TRUEBACKUPD_CHOWN_AND_RESTORECON, data, reply, 0);
-            if (!ok) {
-                return false;
-            }
+            data.writeString16(context);
+            boolean ok = daemon.transact(TRUEBACKUPD_CHOWN_AND_CHCON, data, reply, 0);
+            if (!ok) return false;
             return reply.readInt() == 0;
         } catch (RemoteException e) {
-            Slog.w(TAG, "chown/restorecon transact failed", e);
+            Slog.w(TAG, "chown/chcon transact failed", e);
             return false;
         } finally {
             reply.recycle();

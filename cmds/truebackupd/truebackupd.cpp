@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include <selinux/android.h>
+#include <selinux/selinux.h>
 
 #include <algorithm>
 #include <cstring>
@@ -53,8 +54,8 @@ enum Transaction : uint32_t {
     ZIP_SINGLE_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 3,
     ZIP_MULTI_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 4,
     WRITE_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 5,
-    /** Recursive chown + selinux_android_restorecon (matches backup tools that fix ownership after extract). */
-    CHOWN_AND_RESTORECON = android::IBinder::FIRST_CALL_TRANSACTION + 6,
+    /** Recursive chown + recursive setfilecon(context). */
+    CHOWN_AND_CHCON = android::IBinder::FIRST_CALL_TRANSACTION + 13,
     /** Recursively delete a directory tree (backup package folder under …/apps/…). */
     DELETE_TREE = android::IBinder::FIRST_CALL_TRANSACTION + 7,
     /** Store TrueBackup registration password (fixed location under /data/system/truebackup). */
@@ -83,7 +84,9 @@ static bool ZipDir(const std::string& srcDir, const std::string& outZip);
 static bool UnzipToDir(const std::string& zipPath, const std::string& outDir);
 static bool IsPathTraversal(const std::string& entryName);
 static bool ChownRecursive(const std::string& path, uid_t uid, gid_t gid);
-static bool FixupOwnershipAndSelinux(const std::string& path, int32_t uid, int32_t gid);
+static bool SetfileconRecursive(const std::string& path, const std::string& context);
+static bool FixupOwnershipAndContext(const std::string& path, int32_t uid, int32_t gid,
+                                     const std::string& context);
 static bool RemoveTree(const std::string& path);
 static bool WriteFileAtomic(const std::string& outPath, const uint8_t* data, size_t dataLen);
 
@@ -552,31 +555,50 @@ static bool ChownRecursive(const std::string& path, uid_t uid, gid_t gid) {
     return ok;
 }
 
-static bool FixupOwnershipAndSelinux(const std::string& path, int32_t uid32, int32_t gid32) {
-    if (path.empty() || path[0] != '/') {
-        LOG(ERROR) << "Invalid path for fixup: " << path;
+static bool SetfileconRecursive(const std::string& path, const std::string& context) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0) {
+        PLOG(ERROR) << "SetfileconRecursive lstat failed: " << path;
         return false;
     }
 
-    struct stat st;
-    if (lstat(path.c_str(), &st) != 0) {
-        LOG(ERROR) << "Fixup path missing: " << path;
+    if (lsetfilecon(path.c_str(), context.c_str()) != 0) {
+        PLOG(ERROR) << "lsetfilecon failed: " << path;
+        return false;
+    }
+
+    if (S_ISLNK(st.st_mode) || !S_ISDIR(st.st_mode)) return true;
+
+    DIR* dir = opendir(path.c_str());
+    if (!dir) {
+        PLOG(ERROR) << "SetfileconRecursive opendir failed: " << path;
+        return false;
+    }
+    bool ok = true;
+    dirent* de;
+    while ((de = readdir(dir)) != nullptr) {
+        if (IsDotOrDotDot(de->d_name)) continue;
+        std::string child = path + "/" + de->d_name;
+        if (!SetfileconRecursive(child, context)) {
+            ok = false;
+        }
+    }
+    closedir(dir);
+    return ok;
+}
+
+static bool FixupOwnershipAndContext(const std::string& path, int32_t uid32, int32_t gid32,
+                                     const std::string& context) {
+    if (path.empty() || path[0] != '/' || context.empty()) {
+        LOG(ERROR) << "Invalid args for FixupOwnershipAndContext";
         return false;
     }
 
     uid_t uid = static_cast<uid_t>(uid32);
     gid_t gid = (gid32 < 0) ? uid : static_cast<gid_t>(gid32);
 
-    if (!ChownRecursive(path, uid, gid)) {
-        return false;
-    }
-
-    unsigned int flags = SELINUX_ANDROID_RESTORECON_RECURSE | SELINUX_ANDROID_RESTORECON_SKIP_SEHASH;
-    if (selinux_android_restorecon(path.c_str(), flags) != 0) {
-        PLOG(ERROR) << "selinux_android_restorecon failed: " << path;
-        return false;
-    }
-
+    if (!ChownRecursive(path, uid, gid)) return false;
+    if (!SetfileconRecursive(path, context)) return false;
     return true;
 }
 
@@ -1148,16 +1170,16 @@ class TrueBackupDaemonService : public android::BBinder {
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }
-            case CHOWN_AND_RESTORECON: {
+            case CHOWN_AND_CHCON: {
                 std::string p = std::string(android::String8(data.readString16()).c_str());
                 int32_t uid = data.readInt32();
                 int32_t gid = data.readInt32();
-                if (uid < 0) {
-                    LOG(ERROR) << "Invalid uid for CHOWN_AND_RESTORECON";
+                std::string ctx = std::string(android::String8(data.readString16()).c_str());
+                if (uid < 0 || ctx.empty()) {
                     reply->writeInt32(-1);
                     return android::NO_ERROR;
                 }
-                bool ok = FixupOwnershipAndSelinux(p, uid, gid);
+                bool ok = FixupOwnershipAndContext(p, uid, gid, ctx);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }
