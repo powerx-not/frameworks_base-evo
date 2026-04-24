@@ -294,7 +294,22 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             Slog.w(TAG, "changeRegistrationPassword: empty old");
             return false;
         }
-        if (!daemonChangeRegistrationPassword(oldPassword, newPassword)) {
+        final String currentPlain = readRegistrationPassword();
+        if (currentPlain == null || !currentPlain.equals(oldPassword)) {
+            Slog.w(TAG, "changeRegistrationPassword: old password mismatch");
+            return false;
+        }
+        final String currentStored = readRegistrationPasswordStored();
+        if (currentStored == null || currentStored.isEmpty()) {
+            Slog.w(TAG, "changeRegistrationPassword: missing stored password");
+            return false;
+        }
+        final String newStored = encryptRegisteredPassword(newPassword);
+        if (newStored == null || newStored.isEmpty()) {
+            Slog.w(TAG, "changeRegistrationPassword: encrypt new failed");
+            return false;
+        }
+        if (!daemonChangeRegistrationPassword(currentStored, newStored)) {
             Slog.w(TAG, "changeRegistrationPassword: daemon change failed");
             return false;
         }
@@ -783,7 +798,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         return File.createTempFile(prefix, suffix, getTrueBackupTempDir());
     }
 
-    private synchronized String readRegistrationPassword() {
+    private synchronized String readRegistrationPasswordStored() {
         IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
         if (daemon == null) return null;
         Parcel data = Parcel.obtain();
@@ -796,16 +811,21 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             String stored = reply.readString16();
             if (stored == null) return null;
             stored = stored.trim();
-            if (stored.isEmpty()) return null;
-            String plain = decryptRegisteredPassword(stored);
-            return plain != null ? plain : stored;
+            return stored.isEmpty() ? null : stored;
         } catch (RemoteException e) {
-            Slog.w(TAG, "readRegistrationPassword", e);
+            Slog.w(TAG, "readRegistrationPasswordStored", e);
             return null;
         } finally {
             reply.recycle();
             data.recycle();
         }
+    }
+
+    private synchronized String readRegistrationPassword() {
+        String stored = readRegistrationPasswordStored();
+        if (stored == null) return null;
+        String plain = decryptRegisteredPassword(stored);
+        return plain != null ? plain : stored;
     }
 
     private synchronized boolean writeRegistrationPassword(String pw) {
