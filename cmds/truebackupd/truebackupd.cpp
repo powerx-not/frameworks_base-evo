@@ -84,9 +84,10 @@ static bool ZipDir(const std::string& srcDir, const std::string& outZip);
 static bool UnzipToDir(const std::string& zipPath, const std::string& outDir);
 static bool IsPathTraversal(const std::string& entryName);
 static bool ChownRecursive(const std::string& path, uid_t uid, gid_t gid);
+static bool ChmodRecursive(const std::string& path, mode_t mode);
 static bool SetfileconRecursive(const std::string& path, const std::string& context);
 static bool FixupOwnershipAndContext(const std::string& path, int32_t uid, int32_t gid,
-                                     const std::string& context);
+                                     const std::string& context, int32_t mode);
 static bool RemoveTree(const std::string& path);
 static bool WriteFileAtomic(const std::string& outPath, const uint8_t* data, size_t dataLen);
 
@@ -555,6 +556,40 @@ static bool ChownRecursive(const std::string& path, uid_t uid, gid_t gid) {
     return ok;
 }
 
+static bool ChmodRecursive(const std::string& path, mode_t mode) {
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0) {
+        PLOG(ERROR) << "lstat failed: " << path;
+        return false;
+    }
+    if (S_ISLNK(st.st_mode)) {
+        return true;
+    }
+    if (chmod(path.c_str(), mode) != 0) {
+        PLOG(ERROR) << "chmod failed: " << path;
+        return false;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        return true;
+    }
+    DIR* dir = opendir(path.c_str());
+    if (!dir) {
+        PLOG(ERROR) << "opendir failed: " << path;
+        return false;
+    }
+    bool ok = true;
+    dirent* de;
+    while ((de = readdir(dir)) != nullptr) {
+        if (IsDotOrDotDot(de->d_name)) continue;
+        std::string child = path + "/" + de->d_name;
+        if (!ChmodRecursive(child, mode)) {
+            ok = false;
+        }
+    }
+    closedir(dir);
+    return ok;
+}
+
 static bool SetfileconRecursive(const std::string& path, const std::string& context) {
     struct stat st;
     if (lstat(path.c_str(), &st) != 0) {
@@ -588,7 +623,7 @@ static bool SetfileconRecursive(const std::string& path, const std::string& cont
 }
 
 static bool FixupOwnershipAndContext(const std::string& path, int32_t uid32, int32_t gid32,
-                                     const std::string& context) {
+                                     const std::string& context, int32_t mode32) {
     if (path.empty() || path[0] != '/' || context.empty()) {
         LOG(ERROR) << "Invalid args for FixupOwnershipAndContext";
         return false;
@@ -598,6 +633,10 @@ static bool FixupOwnershipAndContext(const std::string& path, int32_t uid32, int
     gid_t gid = (gid32 < 0) ? uid : static_cast<gid_t>(gid32);
 
     if (!ChownRecursive(path, uid, gid)) return false;
+    if (mode32 >= 0) {
+        const mode_t m = static_cast<mode_t>(mode32) & 07777u;
+        if (!ChmodRecursive(path, m)) return false;
+    }
     if (!SetfileconRecursive(path, context)) return false;
     return true;
 }
@@ -1175,11 +1214,12 @@ class TrueBackupDaemonService : public android::BBinder {
                 int32_t uid = data.readInt32();
                 int32_t gid = data.readInt32();
                 std::string ctx = std::string(android::String8(data.readString16()).c_str());
+                int32_t mode = data.readInt32();
                 if (uid < 0 || ctx.empty()) {
                     reply->writeInt32(-1);
                     return android::NO_ERROR;
                 }
-                bool ok = FixupOwnershipAndContext(p, uid, gid, ctx);
+                bool ok = FixupOwnershipAndContext(p, uid, gid, ctx, mode);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }

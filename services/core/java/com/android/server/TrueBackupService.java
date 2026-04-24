@@ -116,6 +116,11 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final int TRUEBACKUPD_DECRYPT_ZIP_TO_FILE = IBinder.FIRST_CALL_TRANSACTION + 11;
     private static final int TRUEBACKUPD_CHANGE_PASSWORD = IBinder.FIRST_CALL_TRANSACTION + 12;
 
+    /** rwxrw----: package dir under {@code /Android/data/} after restore. */
+    private static final int MODE_ANDROID_DATA_DIR = 0760;
+    /** rwxrwx---: package dir under {@code /Android/media/} and {@code /Android/obb/}. */
+    private static final int MODE_ANDROID_SHARED_PKG_DIR = 0770;
+
     private static final String FILE_CONFIG = "package_restore_config.json";
 
     private static final String DIR_APK = "apk";
@@ -1550,14 +1555,14 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         if (ceZip != null) {
             File target = new File(CE_BASE, packageName);
             unzipToDirMaybeDaemon(ceZip, target);
-            fixupRestoredTree(target, appUid, appUid);
+            fixupRestoredTree(target, appUid, appUid, -1);
         }
 
         File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
         if (deZip.exists()) {
             File target = new File(DE_BASE, packageName);
             unzipToDirMaybeDaemon(deZip, target);
-            fixupRestoredTree(target, appUid, appUid);
+            fixupRestoredTree(target, appUid, appUid, -1);
         }
 
         File extZip = firstExisting(
@@ -1567,7 +1572,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             File target = new File(EXT_DATA_BASE, packageName);
             unzipToDirMaybeDaemon(extZip, target);
             int extGid = statDirGidOrUid(EXT_DATA_GID_REF, appUid);
-            fixupRestoredTree(target, appUid, extGid);
+            fixupRestoredTree(target, appUid, extGid, MODE_ANDROID_DATA_DIR);
         }
 
         File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
@@ -1575,7 +1580,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             File target = new File(OBB_BASE, packageName);
             unzipToDirMaybeDaemon(obbZip, target);
             int obbGid = statDirGidOrUid(OBB_GID_REF, appUid);
-            fixupRestoredTree(target, appUid, obbGid);
+            fixupRestoredTree(target, appUid, obbGid, MODE_ANDROID_SHARED_PKG_DIR);
         }
 
         File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
@@ -1583,7 +1588,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             File target = new File(MEDIA_BASE, packageName);
             unzipToDirMaybeDaemon(mediaZip, target);
             int mediaGid = statDirGidOrUid(MEDIA_GID_REF, appUid);
-            fixupRestoredTree(target, appUid, mediaGid);
+            fixupRestoredTree(target, appUid, mediaGid, MODE_ANDROID_SHARED_PKG_DIR);
         }
 
         applySecurityRestoreFromConfig(packageName, pkgDir);
@@ -1610,8 +1615,11 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     /**
      * Extracted files are owned by root; relabel and chown so the app can run (same idea as
      * {@code PackagesRestoreUtil.restoreData} in Android-DataBackup).
+     *
+     * @param mode octal perms to apply under {@code truebackupd} (e.g. 0760 for
+     *             {@code Android/data} package dirs, 0770 for media/obb), or {@code -1} to skip {@code chmod}.
      */
-    private void fixupRestoredTree(File path, int uid, int gid) {
+    private void fixupRestoredTree(File path, int uid, int gid, int mode) {
         if (path == null || !path.exists()) {
             return;
         }
@@ -1623,7 +1631,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             return;
         }
         String ctx = SELinux.getFileContext(abs);
-        if (ctx != null && !ctx.isEmpty() && chownAndChconWithDaemon(abs, uid, gid, ctx)) {
+        if (ctx != null && !ctx.isEmpty() && chownAndChconWithDaemon(abs, uid, gid, ctx, mode)) {
             return;
         }
         Slog.w(TAG, "truebackupd chown/chcon failed for " + abs + "; trying SELinux.restoreconRecursive only");
@@ -1632,7 +1640,12 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private boolean chownAndChconWithDaemon(String absolutePath, int uid, int gid, String context) {
+    private void fixupRestoredTree(File path, int uid, int gid) {
+        fixupRestoredTree(path, uid, gid, -1);
+    }
+
+    private boolean chownAndChconWithDaemon(String absolutePath, int uid, int gid, String context,
+            int mode) {
         IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
         if (daemon == null || context == null || context.isEmpty()) return false;
         Parcel data = Parcel.obtain();
@@ -1643,6 +1656,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             data.writeInt(uid);
             data.writeInt(gid);
             data.writeString16(context);
+            data.writeInt(mode);
             boolean ok = daemon.transact(TRUEBACKUPD_CHOWN_AND_CHCON, data, reply, 0);
             if (!ok) return false;
             return reply.readInt() == 0;
