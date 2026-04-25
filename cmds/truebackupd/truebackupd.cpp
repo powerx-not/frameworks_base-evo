@@ -89,6 +89,7 @@ static bool EnsureDir(const std::string& path) { return EnsureDir(path, 0755); }
 static bool ZipAddFile(ZipWriter& writer, const std::string& absPath, const std::string& relPath);
 static bool ZipDir(const std::string& srcDir, const std::string& outZip);
 static bool UnzipToDir(const std::string& zipPath, const std::string& outDir);
+static bool IsDotOrDotDot(const char* name);
 static bool IsPathTraversal(const std::string& entryName);
 static bool ChownRecursive(const std::string& path, uid_t uid, gid_t gid);
 static bool ChmodRecursive(const std::string& path, mode_t mode);
@@ -100,9 +101,11 @@ static bool WriteFileAtomic(const std::string& outPath, const uint8_t* data, siz
 static bool RekeyBackupTree(const std::string& dir, const std::string& oldPw, const std::string& newPw);
 static bool RekeyZipFile(const std::string& zipPath, const std::string& oldPw, const std::string& newPw);
 static bool IsEncryptedFilePath(const std::string& path);
+static bool HasEncryptedBackupZip(const std::string& dir, std::string* outZipPath);
 static bool MakeTempPathInTmpDir(std::string* outPath);
 static bool EncryptZipInPlace(const std::string& path, const std::string& password);
 static bool DecryptZipToFile(const std::string& encPath, const std::string& outPath, const std::string& password);
+static bool CanDecryptAnyKnownEncryptedBackup(const std::string& password);
 
 static const char* kPasswordPath = "/data/system/truebackup/registration_password.bin";
 /** One path per line; used to find backup trees for password rekey. */
@@ -217,6 +220,65 @@ static bool AppendKnownBackupPathLine(const std::string& basePath) {
         PLOG(WARNING) << "chown known_paths";
     }
     return true;
+}
+
+static bool IsLikelyBackupAppsDir(const std::string& path) {
+    return android::base::EndsWith(path, "/apps") || path == "apps";
+}
+
+static bool HasEncryptedBackupZip(const std::string& dir, std::string* outZipPath) {
+    struct stat st;
+    if (lstat(dir.c_str(), &st) != 0) return false;
+    if (S_ISLNK(st.st_mode)) return false;
+    if (!S_ISDIR(st.st_mode)) {
+        if (!android::base::EndsWith(dir, ".zip")) return false;
+        if (!IsEncryptedFilePath(dir)) return false;
+        if (outZipPath) *outZipPath = dir;
+        return true;
+    }
+
+    DIR* d = opendir(dir.c_str());
+    if (!d) return false;
+    bool found = false;
+    dirent* de;
+    while (!found && (de = readdir(d)) != nullptr) {
+        if (IsDotOrDotDot(de->d_name)) continue;
+        const std::string child = dir + "/" + de->d_name;
+        if (HasEncryptedBackupZip(child, outZipPath)) {
+            found = true;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static bool CanDecryptAnyKnownEncryptedBackup(const std::string& password) {
+    if (password.empty()) return false;
+    std::string known;
+    if (!ReadFileToString(kKnownPathsPath, &known)) return true;  // nothing known => don't block first set
+
+    std::set<std::string> candidates;
+    for (const auto& raw : android::base::Split(known, "\n")) {
+        std::string p = android::base::Trim(raw);
+        if (p.empty() || p[0] != '/') continue;
+        candidates.insert(p);
+        if (!IsLikelyBackupAppsDir(p)) {
+            candidates.insert(p + "/apps");
+            candidates.insert(p + "/backup/apps");
+        }
+    }
+
+    std::string encZip;
+    for (const auto& c : candidates) {
+        if (HasEncryptedBackupZip(c, &encZip)) {
+            std::string tmpOut;
+            if (!MakeTempPathInTmpDir(&tmpOut)) return false;
+            const bool ok = DecryptZipToFile(encZip, tmpOut, password);
+            (void)unlink(tmpOut.c_str());
+            return ok;
+        }
+    }
+    return true;  // no encrypted backup found => allow first set
 }
 
 static bool ZipSingleFileToZip(const std::string& srcFile, const std::string& outZip,
@@ -1420,8 +1482,19 @@ class TrueBackupDaemonService : public android::BBinder {
                 return android::NO_ERROR;
             }
             case SET_PASSWORD: {
-                std::string pw = std::string(android::String8(data.readString16()).c_str());
-                bool ok = WritePassword(pw);
+                std::string storedPwBlob = std::string(android::String8(data.readString16()).c_str());
+                std::string plainPw = std::string(android::String8(data.readString16()).c_str());
+
+                // First registration after reset: if encrypted backups exist, only allow registration
+                // with the same password that can decrypt the existing backup set.
+                std::string current;
+                const bool hasCurrentStored = ReadFileToString(kPasswordPath, &current) && !android::base::Trim(current).empty();
+                if (!hasCurrentStored && !plainPw.empty() && !CanDecryptAnyKnownEncryptedBackup(plainPw)) {
+                    reply->writeInt32(-2);  // existing backup detected but password mismatch
+                    return android::NO_ERROR;
+                }
+
+                bool ok = WritePassword(storedPwBlob);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }

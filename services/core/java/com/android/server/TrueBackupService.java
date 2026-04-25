@@ -852,6 +852,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         try {
             data.writeInt(TRUEBACKUPD_TOKEN);
             data.writeString16(stored);
+            data.writeString16(pw);
             boolean ok = daemon.transact(TRUEBACKUPD_SET_PASSWORD, data, reply, 0);
             if (!ok) return false;
             return reply.readInt() == 0;
