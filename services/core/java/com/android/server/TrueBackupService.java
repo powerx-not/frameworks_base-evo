@@ -99,6 +99,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private volatile boolean mWorkerRunning = false;
     private String mActiveOperationKind = null;
     private String mActiveOperationPackage = null;
+    private int mActiveOperationProgressPercent = -1;
 
     private static final String TRUEBACKUPD_SERVICE = "truebackupd";
     private static final int TRUEBACKUPD_TOKEN = 0x5452424b; // 'TRBK'
@@ -365,6 +366,21 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         new Thread(this::runOperationWorker, "TrueBackupWorker").start();
     }
 
+    private void setActiveOperationProgressPercent(int percent) {
+        final int p = Math.max(0, Math.min(100, percent));
+        synchronized (this) {
+            mActiveOperationProgressPercent = p;
+        }
+    }
+
+    private void setActiveProgressStep(int done, int total) {
+        if (total <= 0) {
+            setActiveOperationProgressPercent(0);
+            return;
+        }
+        setActiveOperationProgressPercent((done * 100) / total);
+    }
+
     private void runOperationWorker() {
         while (true) {
             QueuedOperation op;
@@ -393,6 +409,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                         break;
                 }
                 mActiveOperationPackage = op.packageName;
+                mActiveOperationProgressPercent = 0;
             }
             try {
                 switch (op.type) {
@@ -415,6 +432,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                 synchronized (this) {
                     mActiveOperationKind = null;
                     mActiveOperationPackage = null;
+                    mActiveOperationProgressPercent = -1;
                 }
                 mWorkInFlight.decrementAndGet();
             }
@@ -425,11 +443,14 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         try {
             Slog.d(TAG, "Starting backup for " + packageName + " to " + destPath);
             recordKnownBackupPath(destPath);
+            final int totalSteps = 7;
+            int done = 0;
             File pkgDir = resolvePackageBackupDir(destPath, packageName);
             if (!ensureDirs(pkgDir)) {
                 Slog.e(TAG, "Could not create backup directory: " + pkgDir);
                 return;
             }
+            setActiveProgressStep(++done, totalSteps);
 
             BackupParts parts = new BackupParts();
 
@@ -437,20 +458,24 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             File apkZip = new File(new File(pkgDir, DIR_APK), ZIP_APK);
             parts.apk = zipApk(packageName, apkZip);
             maybeEncryptInPlace(apkZip);
+            setActiveProgressStep(++done, totalSteps);
 
             // Internal data
             File ceZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER);
             parts.userCe = zipDirIfExists(new File(CE_BASE, packageName), ceZip);
             maybeEncryptInPlace(ceZip);
+            setActiveProgressStep(++done, totalSteps);
 
             File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
             parts.userDe = zipDirIfExists(new File(DE_BASE, packageName), deZip);
             maybeEncryptInPlace(deZip);
+            setActiveProgressStep(++done, totalSteps);
 
             // External data
             File extZip = new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA);
             parts.extData = zipDirIfExists(new File(EXT_DATA_BASE, packageName), extZip);
             maybeEncryptInPlace(extZip);
+            setActiveProgressStep(++done, totalSteps);
 
             // Additional
             File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
@@ -460,8 +485,10 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
             parts.media = zipDirIfExists(new File(MEDIA_BASE, packageName), mediaZip);
             maybeEncryptInPlace(mediaZip);
+            setActiveProgressStep(++done, totalSteps);
 
             writeConfig(new File(pkgDir, FILE_CONFIG), packageName, parts);
+            setActiveProgressStep(++done, totalSteps);
 
             Slog.i(TAG, "Backup finished successfully for " + packageName);
         } catch (Exception e) {
@@ -472,6 +499,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private void executeRestore(String packageName, String sourcePath) {
         try {
             Slog.d(TAG, "Starting restore for " + packageName + " from " + sourcePath);
+            setActiveOperationProgressPercent(5);
             File pkgDir = resolvePackageBackupDir(sourcePath, packageName);
             File legacyDir = new File(sourcePath, packageName + "_data");
 
@@ -480,6 +508,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             } else if (legacyDir.exists()) {
                 File dataDir = new File("/data/data/" + packageName);
                 recursiveCopy(legacyDir, dataDir);
+                setActiveOperationProgressPercent(55);
                 if (isPackageInstalled(packageName)) {
                     try {
                         int appUid = getApplicationUidOrThrow(packageName);
@@ -492,6 +521,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                 if (cfgDir != null && new File(cfgDir, FILE_CONFIG).isFile()) {
                     applySecurityRestoreFromConfig(packageName, cfgDir);
                 }
+                setActiveOperationProgressPercent(100);
             } else {
                 Slog.e(TAG, "Source data not found at " + sourcePath);
                 return;
@@ -506,10 +536,13 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private void executeDeleteBackup(String basePath, String packageName) {
         try {
             Slog.d(TAG, "Starting delete backup for " + packageName);
+            setActiveOperationProgressPercent(10);
             if (deleteBackupPackageInternal(basePath, packageName)) {
+                setActiveOperationProgressPercent(100);
                 Slog.i(TAG, "Delete finished (primary) for " + packageName);
                 return;
             }
+            setActiveOperationProgressPercent(40);
             String json = readBackupMetadataJsonInternal(basePath, packageName);
             if (json != null && !json.isEmpty()) {
                 try {
@@ -519,6 +552,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                     if (sp != null) {
                         String tsp = sp.trim();
                         if (!tsp.isEmpty() && deleteBackupPackageAtPathInternal(basePath, tsp)) {
+                            setActiveOperationProgressPercent(100);
                             Slog.i(TAG, "Delete finished (storagePath) for " + packageName);
                             return;
                         }
@@ -528,8 +562,10 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                 }
             }
             if (deleteBackupPackageInternal(basePath, packageName)) {
+                setActiveOperationProgressPercent(100);
                 Slog.i(TAG, "Delete finished (retry) for " + packageName);
             } else {
+                setActiveOperationProgressPercent(100);
                 Slog.w(TAG, "Delete failed for " + packageName);
             }
         } catch (Exception e) {
@@ -624,6 +660,14 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     }
 
     @Override
+    public int getActiveOperationProgressPercent() {
+        checkPermission();
+        synchronized (this) {
+            return mActiveOperationProgressPercent;
+        }
+    }
+
+    @Override
     public int getQueuedOperationCount() {
         checkPermission();
         return mOperationQueue.size();
@@ -657,7 +701,10 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                         pkg = pkgFromJson;
                     }
                     String lbl = pkgInfo.optString("appLabel", null);
-                    if (lbl != null) {
+                    if (lbl == null || lbl.isEmpty()) {
+                        lbl = pkgInfo.optString("label", null);
+                    }
+                    if (lbl != null && !lbl.isEmpty()) {
                         label = lbl;
                     }
                 }
@@ -1072,6 +1119,15 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             Slog.w(TAG, "rekey skipped: no known backup paths");
             return;
         }
+        int total = 0;
+        for (String basePath : paths) {
+            if (basePath == null || basePath.isEmpty()) continue;
+            File appsDir = resolveAppsDir(basePath);
+            if (appsDir == null || !appsDir.isDirectory()) continue;
+            total++;
+        }
+        if (total <= 0) return;
+        int done = 0;
         for (String basePath : paths) {
             if (basePath == null || basePath.isEmpty()) continue;
             File appsDir = resolveAppsDir(basePath);
@@ -1079,6 +1135,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             if (!daemonRekeyBackupTree(appsDir, oldPassword, newPassword)) {
                 Slog.w(TAG, "daemonRekeyBackupTree failed for " + appsDir);
             }
+            done++;
+            setActiveProgressStep(done, total);
         }
     }
 
@@ -1605,8 +1663,11 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     }
 
     private void restoreFromPackageDir(String packageName, File pkgDir) throws IOException {
+        final int totalSteps = 7;
+        int done = 0;
         // If the app is not installed, install it first from apk.zip so /data_mirror targets exist.
         installApksFromBackupIfNeeded(packageName, pkgDir);
+        setActiveProgressStep(++done, totalSteps);
 
         final int appUid = getApplicationUidOrThrow(packageName);
 
@@ -1618,6 +1679,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             unzipToDirMaybeDaemon(ceZip, target);
             fixupRestoredTree(target, appUid, appUid, -1);
         }
+        setActiveProgressStep(++done, totalSteps);
 
         File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
         if (deZip.exists()) {
@@ -1625,6 +1687,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             unzipToDirMaybeDaemon(deZip, target);
             fixupRestoredTree(target, appUid, appUid, -1);
         }
+        setActiveProgressStep(++done, totalSteps);
 
         File extZip = firstExisting(
                 new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA),
@@ -1635,6 +1698,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             int extGid = statDirGidOrUid(EXT_DATA_GID_REF, appUid);
             fixupRestoredTree(target, appUid, extGid, MODE_ANDROID_DATA_DIR);
         }
+        setActiveProgressStep(++done, totalSteps);
 
         File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
         if (obbZip.exists()) {
@@ -1643,6 +1707,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             int obbGid = statDirGidOrUid(OBB_GID_REF, appUid);
             fixupRestoredTree(target, appUid, obbGid, MODE_ANDROID_SHARED_PKG_DIR);
         }
+        setActiveProgressStep(++done, totalSteps);
 
         File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
         if (mediaZip.exists()) {
@@ -1651,8 +1716,10 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             int mediaGid = statDirGidOrUid(MEDIA_GID_REF, appUid);
             fixupRestoredTree(target, appUid, mediaGid, MODE_ANDROID_SHARED_PKG_DIR);
         }
+        setActiveProgressStep(++done, totalSteps);
 
         applySecurityRestoreFromConfig(packageName, pkgDir);
+        setActiveProgressStep(++done, totalSteps);
     }
 
     private int getApplicationUidOrThrow(String packageName) throws IOException {

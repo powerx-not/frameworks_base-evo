@@ -34,6 +34,9 @@ interface ITrueBackupService {
     /** Package name of the job currently executing; null when idle. */
     String getActiveOperationPackage();
 
+    /** 0..100 while active, or -1 when unknown/idle. */
+    int getActiveOperationProgressPercent();
+
     /** Jobs waiting in the queue (not including the one currently running). */
     int getQueuedOperationCount();
 
