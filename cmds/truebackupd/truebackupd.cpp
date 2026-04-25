@@ -24,6 +24,7 @@
 #include <openssl/evp.h>
 #include <openssl/mem.h>
 #include <openssl/rand.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -68,6 +69,12 @@ enum Transaction : uint32_t {
     DECRYPT_ZIP_TO_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 11,
     /** Change registration password (requires old password). */
     CHANGE_PASSWORD = android::IBinder::FIRST_CALL_TRANSACTION + 12,
+    /** Recursively re-encrypt zip backups under a directory tree. */
+    REKEY_BACKUP_TREE = android::IBinder::FIRST_CALL_TRANSACTION + 14,
+    /** Append a backup base path to known_paths.txt (daemon-owned; system_server cannot write). */
+    APPEND_KNOWN_BACKUP_PATH = android::IBinder::FIRST_CALL_TRANSACTION + 15,
+    /** Return contents of known_paths.txt for rekey discovery. */
+    LIST_KNOWN_BACKUP_PATHS = android::IBinder::FIRST_CALL_TRANSACTION + 16,
 };
 
 static std::string Dirname(const std::string& path) {
@@ -90,8 +97,16 @@ static bool FixupOwnershipAndContext(const std::string& path, int32_t uid, int32
                                      const std::string& context, int32_t mode);
 static bool RemoveTree(const std::string& path);
 static bool WriteFileAtomic(const std::string& outPath, const uint8_t* data, size_t dataLen);
+static bool RekeyBackupTree(const std::string& dir, const std::string& oldPw, const std::string& newPw);
+static bool RekeyZipFile(const std::string& zipPath, const std::string& oldPw, const std::string& newPw);
+static bool IsEncryptedFilePath(const std::string& path);
+static bool MakeTempPathInTmpDir(std::string* outPath);
+static bool EncryptZipInPlace(const std::string& path, const std::string& password);
+static bool DecryptZipToFile(const std::string& encPath, const std::string& outPath, const std::string& password);
 
 static const char* kPasswordPath = "/data/system/truebackup/registration_password.bin";
+/** One path per line; used to find backup trees for password rekey. */
+static const char* kKnownPathsPath = "/data/system/truebackup/known_paths.txt";
 /** system_server creates temp files here (APK decrypt); must be system-owned, not root-only. */
 static const char* kTrueBackupTmpDir = "/data/system/truebackup/tmp";
 
@@ -156,6 +171,51 @@ static bool WriteFileAtomic(const std::string& outPath, const uint8_t* data, siz
         written += static_cast<size_t>(n);
     }
 
+    return true;
+}
+
+static constexpr uid_t kSystemUid = 1000;
+static constexpr gid_t kSystemGid = 1000;
+
+static bool AppendKnownBackupPathLine(const std::string& basePath) {
+    const std::string trimmed = android::base::Trim(basePath);
+    if (trimmed.empty() || trimmed[0] != '/') return false;
+
+    const std::string parent = Dirname(std::string(kKnownPathsPath));
+    if (!EnsureDir(parent, 0755)) {
+        LOG(ERROR) << "AppendKnownBackupPathLine: mkdir parent failed: " << parent;
+        return false;
+    }
+
+    std::string cur;
+    (void)ReadFileToString(kKnownPathsPath, &cur);
+
+    std::set<std::string> uniq;
+    for (const auto& line : android::base::Split(cur, "\n")) {
+        const std::string t = android::base::Trim(line);
+        if (!t.empty()) uniq.insert(t);
+    }
+    if (uniq.count(trimmed) != 0) return true;
+    uniq.insert(trimmed);
+
+    std::string out;
+    bool first = true;
+    for (const auto& p : uniq) {
+        if (!first) out += "\n";
+        first = false;
+        out += p;
+    }
+    out += "\n";
+
+    if (!WriteFileAtomic(kKnownPathsPath, reinterpret_cast<const uint8_t*>(out.data()), out.size())) {
+        return false;
+    }
+    if (chmod(kKnownPathsPath, 0640) != 0) {
+        PLOG(WARNING) << "chmod known_paths";
+    }
+    if (::chown(kKnownPathsPath, kSystemUid, kSystemGid) != 0) {
+        PLOG(WARNING) << "chown known_paths";
+    }
     return true;
 }
 
@@ -287,6 +347,23 @@ static bool EnsureSystemWritableTempDir(const std::string& path) {
     if (chmod(path.c_str(), 0773) != 0) {
         PLOG(WARNING) << "chmod " << path;
     }
+    return true;
+}
+
+static bool MakeTempPathInTmpDir(std::string* outPath) {
+    if (!outPath) return false;
+    if (!EnsureSystemWritableTempDir(kTrueBackupTmpDir)) return false;
+
+    std::string templ = std::string(kTrueBackupTmpDir) + "/tb_rekey_XXXXXX";
+    std::vector<char> buf(templ.begin(), templ.end());
+    buf.push_back('\0');
+    int fd = mkstemp(buf.data());
+    if (fd < 0) {
+        PLOG(ERROR) << "mkstemp failed";
+        return false;
+    }
+    close(fd);
+    *outPath = std::string(buf.data());
     return true;
 }
 
@@ -639,6 +716,119 @@ static bool FixupOwnershipAndContext(const std::string& path, int32_t uid32, int
     }
     if (!SetfileconRecursive(path, context)) return false;
     return true;
+}
+
+static bool IsEncryptedFilePath(const std::string& path) {
+    android::base::unique_fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    if (fd.get() < 0) return false;
+    uint8_t m[4];
+    ssize_t n = read(fd.get(), m, sizeof(m));
+    if (n != static_cast<ssize_t>(sizeof(m))) return false;
+    static const uint8_t kMagic[4] = {'T', 'B', 'K', '1'};
+    return memcmp(m, kMagic, sizeof(kMagic)) == 0;
+}
+
+static bool CopyFileContents(const std::string& src, const std::string& dst, mode_t* priorModeOut) {
+    if (priorModeOut) {
+        struct stat st;
+        if (stat(dst.c_str(), &st) == 0) {
+            *priorModeOut = st.st_mode & 07777u;
+        } else {
+            *priorModeOut = 0;
+        }
+    }
+
+    android::base::unique_fd in(open(src.c_str(), O_RDONLY | O_CLOEXEC));
+    if (in.get() < 0) {
+        PLOG(ERROR) << "open src failed: " << src;
+        return false;
+    }
+
+    // Best-effort replace destination (cross-filesystem rename won't work for /data/system/tmp -> /storage).
+    (void)unlink(dst.c_str());
+    android::base::unique_fd out(open(dst.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644));
+    if (out.get() < 0) {
+        PLOG(ERROR) << "open dst failed: " << dst;
+        return false;
+    }
+
+    std::vector<uint8_t> buf(256 * 1024);
+    while (true) {
+        ssize_t n = read(in.get(), buf.data(), buf.size());
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            PLOG(ERROR) << "read failed: " << src;
+            return false;
+        }
+        if (n == 0) break;
+        size_t written = 0;
+        while (written < static_cast<size_t>(n)) {
+            ssize_t w = write(out.get(), buf.data() + written, static_cast<size_t>(n) - written);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                PLOG(ERROR) << "write failed: " << dst;
+                return false;
+            }
+            written += static_cast<size_t>(w);
+        }
+    }
+    return true;
+}
+
+static bool RekeyZipFile(const std::string& zipPath, const std::string& oldPw, const std::string& newPw) {
+    if (zipPath.empty() || zipPath[0] != '/' || newPw.empty()) return false;
+    if (!android::base::EndsWith(zipPath, ".zip")) return true;
+
+    const bool encrypted = IsEncryptedFilePath(zipPath);
+    if (!encrypted) {
+        return EncryptZipInPlace(zipPath, newPw);
+    }
+    if (oldPw.empty()) {
+        LOG(WARNING) << "RekeyZipFile: old password missing for " << zipPath;
+        return false;
+    }
+
+    std::string tmpPlain;
+    if (!MakeTempPathInTmpDir(&tmpPlain)) return false;
+
+    bool ok = false;
+    mode_t priorMode = 0;
+    do {
+        if (!DecryptZipToFile(zipPath, tmpPlain, oldPw)) break;
+        if (!CopyFileContents(tmpPlain, zipPath, &priorMode)) break;
+        if (priorMode != 0) (void)chmod(zipPath.c_str(), priorMode);
+        if (!EncryptZipInPlace(zipPath, newPw)) break;
+        ok = true;
+    } while (false);
+
+    (void)unlink(tmpPlain.c_str());
+    return ok;
+}
+
+static bool RekeyBackupTree(const std::string& dir, const std::string& oldPw, const std::string& newPw) {
+    if (dir.empty() || dir[0] != '/' || newPw.empty()) return false;
+    struct stat st;
+    if (lstat(dir.c_str(), &st) != 0) {
+        PLOG(ERROR) << "RekeyBackupTree lstat: " << dir;
+        return false;
+    }
+    if (S_ISLNK(st.st_mode)) return true;
+    if (!S_ISDIR(st.st_mode)) return RekeyZipFile(dir, oldPw, newPw);
+
+    DIR* d = opendir(dir.c_str());
+    if (!d) {
+        PLOG(ERROR) << "RekeyBackupTree opendir: " << dir;
+        return false;
+    }
+    bool ok = true;
+    dirent* de;
+    while ((de = readdir(d)) != nullptr) {
+        if (IsDotOrDotDot(de->d_name)) continue;
+        std::string child = dir + "/" + de->d_name;
+        if (!RekeyBackupTree(child, oldPw, newPw)) ok = false;
+    }
+    closedir(d);
+    return ok;
 }
 
 // TrueBackup container v1: wrapped master key in header + payload encrypted by master key.
@@ -1249,6 +1439,27 @@ class TrueBackupDaemonService : public android::BBinder {
                 std::string newPw = std::string(android::String8(data.readString16()).c_str());
                 bool ok = ChangePassword(oldPw, newPw);
                 reply->writeInt32(ok ? 0 : -1);
+                return android::NO_ERROR;
+            }
+            case REKEY_BACKUP_TREE: {
+                std::string p = std::string(android::String8(data.readString16()).c_str());
+                std::string oldPw = std::string(android::String8(data.readString16()).c_str());
+                std::string newPw = std::string(android::String8(data.readString16()).c_str());
+                bool ok = RekeyBackupTree(p, oldPw, newPw);
+                reply->writeInt32(ok ? 0 : -1);
+                return android::NO_ERROR;
+            }
+            case APPEND_KNOWN_BACKUP_PATH: {
+                std::string p = std::string(android::String8(data.readString16()).c_str());
+                bool ok = AppendKnownBackupPathLine(p);
+                reply->writeInt32(ok ? 0 : -1);
+                return android::NO_ERROR;
+            }
+            case LIST_KNOWN_BACKUP_PATHS: {
+                std::string content;
+                (void)ReadFileToString(kKnownPathsPath, &content);
+                reply->writeInt32(0);
+                reply->writeString16(android::String16(content.c_str()));
                 return android::NO_ERROR;
             }
             case ENCRYPT_ZIP_IN_PLACE: {

@@ -2,6 +2,9 @@ package android.os;
 
 /** @hide */
 interface ITrueBackupService {
+    /** Record the backup base path for future re-encryption. */
+    void recordBackupBasePath(String basePath);
+
     void backupPackage(String packageName, String destPath);
     void restorePackage(String packageName, String sourcePath);
 

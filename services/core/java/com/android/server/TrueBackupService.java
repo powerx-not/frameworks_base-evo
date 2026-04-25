@@ -115,6 +115,9 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final int TRUEBACKUPD_ENCRYPT_ZIP_IN_PLACE = IBinder.FIRST_CALL_TRANSACTION + 10;
     private static final int TRUEBACKUPD_DECRYPT_ZIP_TO_FILE = IBinder.FIRST_CALL_TRANSACTION + 11;
     private static final int TRUEBACKUPD_CHANGE_PASSWORD = IBinder.FIRST_CALL_TRANSACTION + 12;
+    private static final int TRUEBACKUPD_REKEY_BACKUP_TREE = IBinder.FIRST_CALL_TRANSACTION + 14;
+    private static final int TRUEBACKUPD_APPEND_KNOWN_BACKUP_PATH = IBinder.FIRST_CALL_TRANSACTION + 15;
+    private static final int TRUEBACKUPD_LIST_KNOWN_BACKUP_PATHS = IBinder.FIRST_CALL_TRANSACTION + 16;
 
     /** rwxrw----: package dir under {@code /Android/data/} after restore. */
     private static final int MODE_ANDROID_DATA_DIR = 0760;
@@ -166,6 +169,12 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     }
 
     @Override
+    public void recordBackupBasePath(String basePath) {
+        checkPermission();
+        recordKnownBackupPath(basePath);
+    }
+
+    @Override
     public void backupPackage(String packageName, String destPath) throws RemoteException {
         checkPermission();
         if (readRegistrationPassword() == null) {
@@ -198,6 +207,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             Slog.w(TAG, "restorePackage: invalid args");
             return;
         }
+        // Remember this tree so future password changes can rekey existing backups there too.
+        recordKnownBackupPath(sourcePath);
         mWorkInFlight.incrementAndGet();
         try {
             mOperationQueue.put(new QueuedOperation(OP_RESTORE, packageName, sourcePath));
@@ -937,39 +948,59 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private File getKnownPathsFile() {
-        return new File(getTrueBackupSystemDir(), "known_paths.txt");
-    }
-
     private synchronized void recordKnownBackupPath(String basePath) {
         if (basePath == null || basePath.isEmpty()) return;
-        File dir = getTrueBackupSystemDir();
-        if (!dir.exists() && !dir.mkdirs()) return;
-        // De-dup on read; keep file append-only to avoid complex locking.
-        try (FileOutputStream out = new FileOutputStream(getKnownPathsFile(), true)) {
-            out.write((basePath + "\n").getBytes(StandardCharsets.UTF_8));
-            out.flush();
-            try {
-                Os.chmod(getKnownPathsFile().getAbsolutePath(), 0600);
-            } catch (Exception ignored) {
-            }
-        } catch (IOException ignored) {
+        final String p = basePath.trim();
+        if (p.isEmpty()) return;
+        if (!daemonAppendKnownBackupPath(p)) {
+            Slog.w(TAG, "recordKnownBackupPath: daemon append failed for " + p);
         }
     }
 
     private synchronized HashSet<String> readKnownBackupPaths() {
         HashSet<String> out = new HashSet<>();
-        File f = getKnownPathsFile();
-        if (!f.isFile()) return out;
-        try (FileInputStream in = new FileInputStream(f)) {
-            String s = new String(readFully(in), StandardCharsets.UTF_8);
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null) return out;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            boolean ok = daemon.transact(TRUEBACKUPD_LIST_KNOWN_BACKUP_PATHS, data, reply, 0);
+            if (!ok) return out;
+            if (reply.readInt() != 0) return out;
+            String s = reply.readString16();
+            if (s == null || s.isEmpty()) return out;
             for (String line : s.split("\n")) {
-                String p = line.trim();
-                if (!p.isEmpty()) out.add(p);
+                String tp = line.trim();
+                if (!tp.isEmpty()) out.add(tp);
             }
-        } catch (IOException ignored) {
+        } catch (RemoteException e) {
+            Slog.w(TAG, "readKnownBackupPaths", e);
+        } finally {
+            reply.recycle();
+            data.recycle();
         }
         return out;
+    }
+
+    private boolean daemonAppendKnownBackupPath(String basePath) {
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null || basePath == null || basePath.isEmpty()) return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            data.writeString16(basePath);
+            boolean ok = daemon.transact(TRUEBACKUPD_APPEND_KNOWN_BACKUP_PATH, data, reply, 0);
+            if (!ok) return false;
+            return reply.readInt() == 0;
+        } catch (RemoteException e) {
+            Slog.w(TAG, "daemonAppendKnownBackupPath", e);
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
     }
 
     private static byte[] readFully(FileInputStream in) throws IOException {
@@ -1006,62 +1037,41 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private void executeRekeyAllKnownBackups(String oldPassword, String newPassword) {
         if (newPassword == null || newPassword.isEmpty()) return;
         HashSet<String> paths = readKnownBackupPaths();
-        if (paths.isEmpty()) return;
+        if (paths.isEmpty()) {
+            Slog.w(TAG, "rekey skipped: no known backup paths");
+            return;
+        }
         for (String basePath : paths) {
             if (basePath == null || basePath.isEmpty()) continue;
             File appsDir = resolveAppsDir(basePath);
             if (appsDir == null || !appsDir.isDirectory()) continue;
-            File[] pkgs = appsDir.listFiles();
-            if (pkgs == null) continue;
-            for (File pkgDir : pkgs) {
-                if (pkgDir == null || !pkgDir.isDirectory()) continue;
-                rekeyZipFilesUnder(pkgDir, oldPassword, newPassword);
+            if (!daemonRekeyBackupTree(appsDir, oldPassword, newPassword)) {
+                Slog.w(TAG, "daemonRekeyBackupTree failed for " + appsDir);
             }
         }
     }
 
-    private void rekeyZipFilesUnder(File pkgDir, String oldPassword, String newPassword) {
-        File[] files = pkgDir.listFiles();
-        if (files == null) return;
-        for (File f : files) {
-            if (f == null) continue;
-            if (f.isDirectory()) {
-                rekeyZipFilesUnder(f, oldPassword, newPassword);
-                continue;
-            }
-            if (!f.isFile()) continue;
-            if (!f.getName().endsWith(".zip")) continue;
-            try {
-                if (isEncryptedFile(f)) {
-                    File plainTmp = null;
-                    try {
-                        plainTmp = createTrueBackupWorkFile("tb_rekey_", ".zip");
-                        if (!daemonDecryptZipToFile(f, plainTmp, oldPassword)) {
-                            Slog.w(TAG, "rekey decrypt failed: " + f);
-                            continue;
-                        }
-                        if (!f.delete()) {
-                            Slog.w(TAG, "rekey could not delete encrypted file: " + f);
-                            continue;
-                        }
-                        Files.copy(plainTmp.toPath(), f.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                        if (!daemonEncryptZipInPlace(f, newPassword)) {
-                            Slog.w(TAG, "rekey encrypt failed: " + f);
-                        }
-                    } finally {
-                        if (plainTmp != null) {
-                            //noinspection ResultOfMethodCallIgnored
-                            plainTmp.delete();
-                        }
-                    }
-                } else {
-                    if (!daemonEncryptZipInPlace(f, newPassword)) {
-                        Slog.w(TAG, "rekey encrypt plain failed: " + f);
-                    }
-                }
-            } catch (Exception e) {
-                Slog.w(TAG, "rekey failed: " + f, e);
-            }
+    private boolean daemonRekeyBackupTree(File dir, String oldPassword, String newPassword) {
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null || dir == null || !dir.isDirectory() || newPassword == null || newPassword.isEmpty()) {
+            return false;
+        }
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            data.writeString16(dir.getAbsolutePath());
+            data.writeString16(oldPassword != null ? oldPassword : "");
+            data.writeString16(newPassword);
+            boolean ok = daemon.transact(TRUEBACKUPD_REKEY_BACKUP_TREE, data, reply, 0);
+            if (!ok) return false;
+            return reply.readInt() == 0;
+        } catch (RemoteException e) {
+            Slog.w(TAG, "daemonRekeyBackupTree", e);
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
         }
     }
 
