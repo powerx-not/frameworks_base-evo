@@ -118,6 +118,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final int TRUEBACKUPD_REKEY_BACKUP_TREE = IBinder.FIRST_CALL_TRANSACTION + 14;
     private static final int TRUEBACKUPD_APPEND_KNOWN_BACKUP_PATH = IBinder.FIRST_CALL_TRANSACTION + 15;
     private static final int TRUEBACKUPD_LIST_KNOWN_BACKUP_PATHS = IBinder.FIRST_CALL_TRANSACTION + 16;
+    private static final int TRUEBACKUPD_CLEAR_PASSWORD = IBinder.FIRST_CALL_TRANSACTION + 17;
 
     /** rwxrw----: package dir under {@code /Android/data/} after restore. */
     private static final int MODE_ANDROID_DATA_DIR = 0760;
@@ -292,6 +293,16 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
         enqueueRekey(old, newPassword);
         return true;
+    }
+
+    @Override
+    public boolean clearRegistrationPassword() throws RemoteException {
+        checkPermission();
+        if (!daemonClearRegistrationPassword()) {
+            Slog.w(TAG, "clearRegistrationPassword: daemon clear failed");
+            return false;
+        }
+        return readRegistrationPassword() == null;
     }
 
     @Override
@@ -879,6 +890,25 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             return reply.readInt() == 0;
         } catch (RemoteException e) {
             Slog.w(TAG, "daemonChangeRegistrationPassword", e);
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    private boolean daemonClearRegistrationPassword() {
+        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
+        if (daemon == null) return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInt(TRUEBACKUPD_TOKEN);
+            boolean ok = daemon.transact(TRUEBACKUPD_CLEAR_PASSWORD, data, reply, 0);
+            if (!ok) return false;
+            return reply.readInt() == 0;
+        } catch (RemoteException e) {
+            Slog.w(TAG, "daemonClearRegistrationPassword", e);
             return false;
         } finally {
             reply.recycle();

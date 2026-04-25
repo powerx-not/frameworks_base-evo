@@ -22,6 +22,9 @@ interface ITrueBackupService {
 
     /** Resets the registration password and re-encrypts existing backups. */
     boolean resetRegistrationPassword(String newPassword);
+
+    /** Deletes the current registration password. */
+    boolean clearRegistrationPassword();
     String[] listBackedUpApps(String basePath);
     boolean isOperationInProgress();
 

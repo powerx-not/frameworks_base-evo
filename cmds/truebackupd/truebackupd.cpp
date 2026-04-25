@@ -75,6 +75,8 @@ enum Transaction : uint32_t {
     APPEND_KNOWN_BACKUP_PATH = android::IBinder::FIRST_CALL_TRANSACTION + 15,
     /** Return contents of known_paths.txt for rekey discovery. */
     LIST_KNOWN_BACKUP_PATHS = android::IBinder::FIRST_CALL_TRANSACTION + 16,
+    /** Delete registration password file. */
+    CLEAR_PASSWORD = android::IBinder::FIRST_CALL_TRANSACTION + 17,
 };
 
 static std::string Dirname(const std::string& path) {
@@ -148,6 +150,11 @@ static bool ChangePassword(const std::string& oldPw, const std::string& newPw) {
     current = android::base::Trim(current);
     if (current != oldPw) return false;
     return WritePassword(newPw);
+}
+
+static bool ClearPassword() {
+    if (unlink(kPasswordPath) == 0) return true;
+    return errno == ENOENT;
 }
 
 static bool WriteFileAtomic(const std::string& outPath, const uint8_t* data, size_t dataLen) {
@@ -1511,6 +1518,11 @@ class TrueBackupDaemonService : public android::BBinder {
                 std::string oldPw = std::string(android::String8(data.readString16()).c_str());
                 std::string newPw = std::string(android::String8(data.readString16()).c_str());
                 bool ok = ChangePassword(oldPw, newPw);
+                reply->writeInt32(ok ? 0 : -1);
+                return android::NO_ERROR;
+            }
+            case CLEAR_PASSWORD: {
+                bool ok = ClearPassword();
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }
