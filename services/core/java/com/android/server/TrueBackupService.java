@@ -32,7 +32,6 @@ import org.xmlpull.v1.XmlPullParser;
 
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
@@ -46,9 +45,6 @@ import java.util.Base64;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
-import java.util.zip.ZipOutputStream;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -106,7 +102,6 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final int TRUEBACKUPD_ZIP_DIR = IBinder.FIRST_CALL_TRANSACTION;
     private static final int TRUEBACKUPD_UNZIP_TO_DIR = IBinder.FIRST_CALL_TRANSACTION + 1;
     private static final int TRUEBACKUPD_MKDIRS = IBinder.FIRST_CALL_TRANSACTION + 2;
-    private static final int TRUEBACKUPD_ZIP_SINGLE_FILE = IBinder.FIRST_CALL_TRANSACTION + 3;
     private static final int TRUEBACKUPD_ZIP_MULTI_FILE = IBinder.FIRST_CALL_TRANSACTION + 4;
     private static final int TRUEBACKUPD_WRITE_FILE = IBinder.FIRST_CALL_TRANSACTION + 5;
     private static final int TRUEBACKUPD_CHOWN_AND_CHCON = IBinder.FIRST_CALL_TRANSACTION + 13;
@@ -140,8 +135,6 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final String ZIP_OBB = "obb.zip";
     private static final String ZIP_MEDIA = "media.zip";
 
-    private static final String ZIP_USER_CE_LEGACY = "user_ce.zip";
-    private static final String ZIP_EXT_DATA_LEGACY = "external_data.zip";
 
     private static final String CE_BASE = "/data/user/0/";
     private static final String DE_BASE = "/data/user_de/0/";
@@ -501,27 +494,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             Slog.d(TAG, "Starting restore for " + packageName + " from " + sourcePath);
             setActiveOperationProgressPercent(5);
             File pkgDir = resolvePackageBackupDir(sourcePath, packageName);
-            File legacyDir = new File(sourcePath, packageName + "_data");
-
             if (pkgDir.exists()) {
                 restoreFromPackageDir(packageName, pkgDir);
-            } else if (legacyDir.exists()) {
-                File dataDir = new File("/data/data/" + packageName);
-                recursiveCopy(legacyDir, dataDir);
-                setActiveOperationProgressPercent(55);
-                if (isPackageInstalled(packageName)) {
-                    try {
-                        int appUid = getApplicationUidOrThrow(packageName);
-                        fixupRestoredTree(dataDir, appUid, appUid);
-                    } catch (IOException e) {
-                        Slog.w(TAG, "Legacy restore: could not fix ownership for " + packageName, e);
-                    }
-                }
-                File cfgDir = resolvePackageBackupDir(sourcePath, packageName);
-                if (cfgDir != null && new File(cfgDir, FILE_CONFIG).isFile()) {
-                    applySecurityRestoreFromConfig(packageName, cfgDir);
-                }
-                setActiveOperationProgressPercent(100);
             } else {
                 Slog.e(TAG, "Source data not found at " + sourcePath);
                 return;
@@ -804,12 +778,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             return false;
         }
         String abs = dir.getAbsolutePath();
-        if (deleteTreeWithDaemon(abs)) {
-            return true;
-        }
-        Slog.w(TAG, "deleteTreeWithDaemon failed; fallback recursiveDelete for " + abs);
-        recursiveDelete(dir);
-        return !dir.exists();
+        return deleteTreeWithDaemon(abs);
     }
 
     private boolean deleteTreeWithDaemon(String absPath) {
@@ -865,6 +834,17 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
     private File createTrueBackupWorkFile(String prefix, String suffix) throws IOException {
         return File.createTempFile(prefix, suffix, getTrueBackupTempDir());
+    }
+
+    private File createTrueBackupWorkDir(String prefix) throws IOException {
+        File dir = File.createTempFile(prefix, "", getTrueBackupTempDir());
+        if (!dir.delete()) {
+            throw new IOException("Could not prepare temp dir: " + dir);
+        }
+        if (!mkdirsMaybeDaemon(dir) || !dir.isDirectory()) {
+            throw new IOException("Could not create temp dir: " + dir);
+        }
+        return dir;
     }
 
     private synchronized String readRegistrationPasswordStored() {
@@ -1259,65 +1239,68 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             zipToRead = tmpDecrypted;
         }
 
-        // Install via PackageInstaller session (supports splits).
-        PackageManager pm = mContext.getPackageManager();
-        PackageInstaller installer = pm.getPackageInstaller();
-        PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
-                PackageInstaller.SessionParams.MODE_FULL_INSTALL);
-        params.setAppPackageName(packageName);
-
-        int sessionId = installer.createSession(params);
-        PackageInstaller.Session session = installer.openSession(sessionId);
+        File tmpApkExtractDir = createTrueBackupWorkDir("truebackup_apk_extract_");
         try {
-            byte[] buffer = new byte[128 * 1024];
+            if (!unzipToDirWithDaemon(zipToRead, tmpApkExtractDir)) {
+                throw new IOException("Could not extract apk.zip via daemon: " + apkZip);
+            }
 
-            boolean wroteAny = false;
-            try (ZipInputStream zis = new ZipInputStream(new FileInputStream(zipToRead))) {
-                ZipEntry entry;
-                while ((entry = zis.getNextEntry()) != null) {
-                    if (entry.isDirectory()) continue;
-                    String name = entry.getName();
-                    if (name == null || !name.endsWith(".apk")) continue;
+            List<File> apkFiles = new ArrayList<>();
+            collectApkFiles(tmpApkExtractDir, apkFiles);
+            if (apkFiles.isEmpty()) {
+                throw new IOException("No APK entries found inside: " + apkZip);
+            }
 
-                    String apkName = new File(name).getName();
-                    if (apkName.isEmpty()) continue;
+            // Install via PackageInstaller session (supports splits).
+            PackageManager pm = mContext.getPackageManager();
+            PackageInstaller installer = pm.getPackageInstaller();
+            PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
+                    PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            params.setAppPackageName(packageName);
 
-                    try (java.io.OutputStream out = session.openWrite(apkName, 0, entry.getSize())) {
+            int sessionId = installer.createSession(params);
+            PackageInstaller.Session session = installer.openSession(sessionId);
+            try {
+                byte[] buffer = new byte[128 * 1024];
+                for (File apkFile : apkFiles) {
+                    String apkName = apkFile.getName();
+                    if (apkName.isEmpty()) {
+                        continue;
+                    }
+                    try (FileInputStream in = new FileInputStream(apkFile);
+                         java.io.OutputStream out = session.openWrite(apkName, 0, apkFile.length())) {
                         int n;
-                        while ((n = zis.read(buffer)) > 0) {
+                        while ((n = in.read(buffer)) > 0) {
                             out.write(buffer, 0, n);
                         }
                         session.fsync(out);
                     }
-                    wroteAny = true;
                 }
-            }
 
-            if (!wroteAny) {
-                throw new IOException("No APK entries found inside: " + apkZip);
-            }
-
-            LocalIntentReceiver receiver = new LocalIntentReceiver();
-            session.commit(receiver.getIntentSender());
-            Intent result = receiver.getResult(120_000);
-            if (result == null) {
-                throw new IOException("Timed out waiting for install result for: " + packageName);
-            }
-            int status = result.getIntExtra(PackageInstaller.EXTRA_STATUS,
-                    PackageInstaller.STATUS_FAILURE);
-            if (status != PackageInstaller.STATUS_SUCCESS) {
-                String msg = result.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
-                throw new IOException("Install failed for " + packageName + ": status=" + status + " msg=" + msg);
+                LocalIntentReceiver receiver = new LocalIntentReceiver();
+                session.commit(receiver.getIntentSender());
+                Intent result = receiver.getResult(120_000);
+                if (result == null) {
+                    throw new IOException("Timed out waiting for install result for: " + packageName);
+                }
+                int status = result.getIntExtra(PackageInstaller.EXTRA_STATUS,
+                        PackageInstaller.STATUS_FAILURE);
+                if (status != PackageInstaller.STATUS_SUCCESS) {
+                    String msg = result.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+                    throw new IOException("Install failed for " + packageName + ": status=" + status + " msg=" + msg);
+                }
+            } finally {
+                session.close();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted waiting for install result for: " + packageName, e);
         } finally {
-            session.close();
             if (tmpDecrypted != null) {
                 //noinspection ResultOfMethodCallIgnored
                 tmpDecrypted.delete();
             }
+            deleteTreeWithDaemon(tmpApkExtractDir.getAbsolutePath());
         }
 
         // Verify installed.
@@ -1326,19 +1309,23 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private static void recursiveDelete(File f) {
-        if (f == null || !f.exists()) return;
-        if (f.isDirectory()) {
-            File[] children = f.listFiles();
-            if (children != null) {
-                for (File c : children) {
-                    recursiveDelete(c);
-                }
-            }
+    private static void collectApkFiles(File dir, List<File> out) {
+        if (dir == null || out == null || !dir.exists()) {
+            return;
         }
-        // Best-effort.
-        //noinspection ResultOfMethodCallIgnored
-        f.delete();
+        if (dir.isFile()) {
+            if (dir.getName().endsWith(".apk")) {
+                out.add(dir);
+            }
+            return;
+        }
+        File[] children = dir.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (File child : children) {
+            collectApkFiles(child, out);
+        }
     }
 
     private static final class BackupParts {
@@ -1454,10 +1441,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     }
 
     private boolean mkdirsMaybeDaemon(File dir) {
-        if (mkdirsWithDaemon(dir)) {
-            return true;
-        }
-        return dir.mkdirs();
+        return mkdirsWithDaemon(dir);
     }
 
     private boolean mkdirsWithDaemon(File dir) {
@@ -1511,29 +1495,6 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private boolean zipSingleFileWithDaemon(File sourceFile, File outZip, String entryName) {
-        IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
-        if (daemon == null) return false;
-
-        android.os.Parcel data = android.os.Parcel.obtain();
-        android.os.Parcel reply = android.os.Parcel.obtain();
-        try {
-            data.writeInt(TRUEBACKUPD_TOKEN);
-            data.writeString16(sourceFile.getAbsolutePath());
-            data.writeString16(outZip.getAbsolutePath());
-            data.writeString16(entryName);
-            boolean ok = daemon.transact(TRUEBACKUPD_ZIP_SINGLE_FILE, data, reply, 0);
-            if (!ok) return false;
-            int rc = reply.readInt();
-            return rc == 0;
-        } catch (RemoteException e) {
-            return false;
-        } finally {
-            reply.recycle();
-            data.recycle();
-        }
-    }
-
     private boolean zipApk(String packageName, File outZip) throws IOException {
         PackageManager pm = mContext.getPackageManager();
         ApplicationInfo ai;
@@ -1568,98 +1529,15 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             entries[1 + i] = f.getName();
         }
 
-        // Prefer daemon (system_server may not be allowed to read split APKs under /data/app).
-        if (zipMultiFileWithDaemon(files, entries, outZip)) {
-            return true;
-        }
-
-        // Fallback: create zip in Java (may fail under SELinux, but keeps behavior consistent).
-        File parent = outZip.getParentFile();
-        if (parent != null && !parent.exists() && !parent.mkdirs()) {
-            throw new IOException("Could not create directory: " + parent);
-        }
-
-        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outZip))) {
-            for (int i = 0; i < files.length; i++) {
-                File f = files[i];
-                if (f == null || !f.exists() || !f.isFile()) {
-                    continue;
-                }
-                zos.putNextEntry(new ZipEntry(entries[i]));
-                try (FileInputStream in = new FileInputStream(f)) {
-                    copy(in, zos);
-                }
-                zos.closeEntry();
-            }
-        }
-
-        return true;
+        return zipMultiFileWithDaemon(files, entries, outZip);
     }
 
     private boolean zipDirIfExists(File sourceDir, File outZip) throws IOException {
-        // Try daemon first: system_server may not be able to stat /data_mirror paths due to SELinux.
-        if (zipDirectoryWithDaemon(sourceDir, outZip)) {
-            return true;
-        }
-
         if (!sourceDir.exists()) {
             return false;
         }
 
-        zipDirectory(sourceDir, outZip);
-        return true;
-    }
-
-    private void zipSingleFile(File sourceFile, File outZip, String entryName) throws IOException {
-        if (zipSingleFileWithDaemon(sourceFile, outZip, entryName)) {
-            return;
-        }
-
-        File parent = outZip.getParentFile();
-        if (parent != null && !parent.exists() && !parent.mkdirs()) {
-            throw new IOException("Could not create directory: " + parent);
-        }
-
-        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outZip))) {
-            ZipEntry entry = new ZipEntry(entryName);
-            zos.putNextEntry(entry);
-            try (FileInputStream in = new FileInputStream(sourceFile)) {
-                copy(in, zos);
-            }
-            zos.closeEntry();
-        }
-    }
-
-    private void zipDirectory(File sourceDir, File outZip) throws IOException {
-        File parent = outZip.getParentFile();
-        if (parent != null && !parent.exists() && !parent.mkdirs()) {
-            throw new IOException("Could not create directory: " + parent);
-        }
-
-        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(outZip))) {
-            zipDirectoryInternal(sourceDir, sourceDir, zos);
-        }
-    }
-
-    private void zipDirectoryInternal(File rootDir, File current, ZipOutputStream zos) throws IOException {
-        File[] children = current.listFiles();
-        if (children == null) return;
-
-        for (File child : children) {
-            String entryName = rootDir.toURI().relativize(child.toURI()).getPath();
-            if (child.isDirectory()) {
-                if (!entryName.endsWith("/")) entryName = entryName + "/";
-                zos.putNextEntry(new ZipEntry(entryName));
-                zos.closeEntry();
-                zipDirectoryInternal(rootDir, child, zos);
-            } else {
-                zos.putNextEntry(new ZipEntry(entryName));
-                try (FileInputStream in = new FileInputStream(child)) {
-                    copy(in, zos);
-                }
-                zos.closeEntry();
-            }
-        }
+        return zipDirectoryWithDaemon(sourceDir, outZip);
     }
 
     private void restoreFromPackageDir(String packageName, File pkgDir) throws IOException {
@@ -1671,10 +1549,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
         final int appUid = getApplicationUidOrThrow(packageName);
 
-        File ceZip = firstExisting(
-                new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER),
-                new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_CE_LEGACY));
-        if (ceZip != null) {
+        File ceZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER);
+        if (ceZip.exists()) {
             File target = new File(CE_BASE, packageName);
             unzipToDirMaybeDaemon(ceZip, target);
             fixupRestoredTree(target, appUid, appUid, -1);
@@ -1689,10 +1565,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
         setActiveProgressStep(++done, totalSteps);
 
-        File extZip = firstExisting(
-                new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA),
-                new File(new File(pkgDir, DIR_EXT_DATA), ZIP_EXT_DATA_LEGACY));
-        if (extZip != null) {
+        File extZip = new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA);
+        if (extZip.exists()) {
             File target = new File(EXT_DATA_BASE, packageName);
             unzipToDirMaybeDaemon(extZip, target);
             int extGid = statDirGidOrUid(EXT_DATA_GID_REF, appUid);
@@ -1762,10 +1636,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         if (ctx != null && !ctx.isEmpty() && chownAndChconWithDaemon(abs, uid, gid, ctx, mode)) {
             return;
         }
-        Slog.w(TAG, "truebackupd chown/chcon failed for " + abs + "; trying SELinux.restoreconRecursive only");
-        if (!SELinux.restoreconRecursive(path)) {
-            Slog.e(TAG, "SELinux.restoreconRecursive failed for " + abs);
-        }
+        Slog.e(TAG, "truebackupd chown/chcon failed for " + abs);
     }
 
     private void fixupRestoredTree(File path, int uid, int gid) {
@@ -1877,10 +1748,9 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                 }
                 toUnzip = tmp;
             }
-            if (unzipToDirWithDaemon(toUnzip, targetDir)) {
-                return;
+            if (!unzipToDirWithDaemon(toUnzip, targetDir)) {
+                throw new IOException("Unzip failed via daemon for " + toUnzip);
             }
-            unzipToDir(toUnzip, targetDir);
         } finally {
             if (tmp != null) {
                 //noinspection ResultOfMethodCallIgnored
@@ -1909,49 +1779,6 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             reply.recycle();
             data.recycle();
         }
-    }
-
-    private File firstExisting(File a, File b) {
-        if (a.exists()) return a;
-        if (b.exists()) return b;
-        return null;
-    }
-
-    private void unzipToDir(File zipFile, File targetDir) throws IOException {
-        if (!targetDir.exists() && !targetDir.mkdirs()) {
-            throw new IOException("Could not create directory: " + targetDir);
-        }
-
-        try (ZipInputStream zis = new ZipInputStream(new FileInputStream(zipFile))) {
-            ZipEntry entry;
-            while ((entry = zis.getNextEntry()) != null) {
-                File out = new File(targetDir, entry.getName());
-                if (!isSubPath(targetDir, out)) {
-                    throw new IOException("Zip entry path traversal: " + entry.getName());
-                }
-
-                if (entry.isDirectory()) {
-                    if (!out.exists() && !out.mkdirs()) {
-                        throw new IOException("Could not create directory: " + out);
-                    }
-                } else {
-                    File parent = out.getParentFile();
-                    if (parent != null && !parent.exists() && !parent.mkdirs()) {
-                        throw new IOException("Could not create directory: " + parent);
-                    }
-                    try (FileOutputStream fos = new FileOutputStream(out)) {
-                        copy(zis, fos);
-                    }
-                }
-                zis.closeEntry();
-            }
-        }
-    }
-
-    private boolean isSubPath(File base, File child) throws IOException {
-        String basePath = base.getCanonicalPath();
-        String childPath = child.getCanonicalPath();
-        return childPath.equals(basePath) || childPath.startsWith(basePath + File.separator);
     }
 
     private void writeConfig(File outConfig, String packageName, BackupParts parts)
@@ -2044,17 +1871,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
         byte[] data = obj.toString(2).getBytes(StandardCharsets.UTF_8);
 
-        if (writeFileWithDaemon(outConfig, data)) {
-            return;
-        }
-
-        File parent = outConfig.getParentFile();
-        if (parent != null && !parent.exists() && !parent.mkdirs()) {
-            throw new IOException("Could not create directory: " + parent);
-        }
-
-        try (FileOutputStream fos = new FileOutputStream(outConfig)) {
-            fos.write(data);
+        if (!writeFileWithDaemon(outConfig, data)) {
+            throw new IOException("Daemon write failed for " + outConfig);
         }
     }
 
@@ -2077,53 +1895,6 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         } finally {
             reply.recycle();
             parcel.recycle();
-        }
-    }
-
-    private void recursiveCopy(File source, File destination) throws IOException {
-        if (source.isDirectory()) {
-            if (!destination.exists() && !destination.mkdirs()) {
-                throw new IOException("Could not create directory: " + destination);
-            }
-            String[] children = source.list();
-            if (children != null) {
-                for (String child : children) {
-                    recursiveCopy(new File(source, child), new File(destination, child));
-                }
-            }
-        } else {
-            try (FileInputStream in = new FileInputStream(source);
-                 FileOutputStream out = new FileOutputStream(destination)) {
-                byte[] buf = new byte[1024 * 16];
-                int len;
-                while ((len = in.read(buf)) > 0) {
-                    out.write(buf, 0, len);
-                }
-            }
-        }
-    }
-
-    private void copy(FileInputStream in, FileOutputStream out) throws IOException {
-        byte[] buf = new byte[1024 * 16];
-        int len;
-        while ((len = in.read(buf)) > 0) {
-            out.write(buf, 0, len);
-        }
-    }
-
-    private void copy(FileInputStream in, ZipOutputStream out) throws IOException {
-        byte[] buf = new byte[1024 * 16];
-        int len;
-        while ((len = in.read(buf)) > 0) {
-            out.write(buf, 0, len);
-        }
-    }
-
-    private void copy(ZipInputStream in, FileOutputStream out) throws IOException {
-        byte[] buf = new byte[1024 * 16];
-        int len;
-        while ((len = in.read(buf)) > 0) {
-            out.write(buf, 0, len);
         }
     }
 
