@@ -45,6 +45,8 @@ import java.util.Base64;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -836,17 +838,6 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         return File.createTempFile(prefix, suffix, getTrueBackupTempDir());
     }
 
-    private File createTrueBackupWorkDir(String prefix) throws IOException {
-        File dir = File.createTempFile(prefix, "", getTrueBackupTempDir());
-        if (!dir.delete()) {
-            throw new IOException("Could not prepare temp dir: " + dir);
-        }
-        if (!mkdirsMaybeDaemon(dir) || !dir.isDirectory()) {
-            throw new IOException("Could not create temp dir: " + dir);
-        }
-        return dir;
-    }
-
     private synchronized String readRegistrationPasswordStored() {
         IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
         if (daemon == null) return null;
@@ -1239,18 +1230,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             zipToRead = tmpDecrypted;
         }
 
-        File tmpApkExtractDir = createTrueBackupWorkDir("truebackup_apk_extract_");
         try {
-            if (!unzipToDirWithDaemon(zipToRead, tmpApkExtractDir)) {
-                throw new IOException("Could not extract apk.zip via daemon: " + apkZip);
-            }
-
-            List<File> apkFiles = new ArrayList<>();
-            collectApkFiles(tmpApkExtractDir, apkFiles);
-            if (apkFiles.isEmpty()) {
-                throw new IOException("No APK entries found inside: " + apkZip);
-            }
-
             // Install via PackageInstaller session (supports splits).
             PackageManager pm = mContext.getPackageManager();
             PackageInstaller installer = pm.getPackageInstaller();
@@ -1262,19 +1242,30 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             PackageInstaller.Session session = installer.openSession(sessionId);
             try {
                 byte[] buffer = new byte[128 * 1024];
-                for (File apkFile : apkFiles) {
-                    String apkName = apkFile.getName();
-                    if (apkName.isEmpty()) {
-                        continue;
-                    }
-                    try (FileInputStream in = new FileInputStream(apkFile);
-                         java.io.OutputStream out = session.openWrite(apkName, 0, apkFile.length())) {
-                        int n;
-                        while ((n = in.read(buffer)) > 0) {
-                            out.write(buffer, 0, n);
+                boolean wroteAny = false;
+                try (ZipInputStream zis = new ZipInputStream(new FileInputStream(zipToRead))) {
+                    ZipEntry entry;
+                    while ((entry = zis.getNextEntry()) != null) {
+                        if (entry.isDirectory()) continue;
+                        String name = entry.getName();
+                        if (name == null || !name.endsWith(".apk")) continue;
+
+                        String apkName = new File(name).getName();
+                        if (apkName.isEmpty()) continue;
+
+                        try (java.io.OutputStream out = session.openWrite(apkName, 0, entry.getSize())) {
+                            int n;
+                            while ((n = zis.read(buffer)) > 0) {
+                                out.write(buffer, 0, n);
+                            }
+                            session.fsync(out);
                         }
-                        session.fsync(out);
+                        wroteAny = true;
                     }
+                }
+
+                if (!wroteAny) {
+                    throw new IOException("No APK entries found inside: " + apkZip);
                 }
 
                 LocalIntentReceiver receiver = new LocalIntentReceiver();
@@ -1300,7 +1291,6 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                 //noinspection ResultOfMethodCallIgnored
                 tmpDecrypted.delete();
             }
-            deleteTreeWithDaemon(tmpApkExtractDir.getAbsolutePath());
         }
 
         // Verify installed.
@@ -1309,24 +1299,6 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private static void collectApkFiles(File dir, List<File> out) {
-        if (dir == null || out == null || !dir.exists()) {
-            return;
-        }
-        if (dir.isFile()) {
-            if (dir.getName().endsWith(".apk")) {
-                out.add(dir);
-            }
-            return;
-        }
-        File[] children = dir.listFiles();
-        if (children == null) {
-            return;
-        }
-        for (File child : children) {
-            collectApkFiles(child, out);
-        }
-    }
 
     private static final class BackupParts {
         boolean apk;
