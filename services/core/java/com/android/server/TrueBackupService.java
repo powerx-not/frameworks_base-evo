@@ -8,6 +8,7 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.content.pm.PermissionInfo;
+import android.net.Uri;
 import android.os.Environment;
 import android.os.IBinder;
 import android.os.ITrueBackupService;
@@ -18,6 +19,7 @@ import android.os.ServiceManager;
 import android.os.UserHandle;
 import android.system.ErrnoException;
 import android.system.Os;
+import android.provider.DocumentsContract;
 import android.util.Slog;
 import android.util.Xml;
 import android.security.keystore.KeyGenParameterSpec;
@@ -999,7 +1001,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
     private synchronized void recordKnownBackupPath(String basePath) {
         if (basePath == null || basePath.isEmpty()) return;
-        final String p = basePath.trim();
+        final String p = normalizeBasePath(basePath);
         if (p.isEmpty()) return;
         if (!daemonAppendKnownBackupPath(p)) {
             Slog.w(TAG, "recordKnownBackupPath: daemon append failed for " + p);
@@ -1136,8 +1138,9 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     }
 
     private static File resolveAppsDir(String basePath) {
-        if (basePath == null) return null;
-        File base = new File(basePath);
+        final String normalized = normalizeBasePath(basePath);
+        if (normalized == null || normalized.isEmpty()) return null;
+        File base = new File(normalized);
 
         if (base.isDirectory() && "apps".equals(base.getName())) {
             return base;
@@ -1360,7 +1363,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     }
 
     private File resolvePackageBackupDir(String basePath, String packageName) {
-        File base = new File(basePath);
+        final String normalized = normalizeBasePath(basePath);
+        File base = new File(normalized != null ? normalized : basePath);
 
         // If caller already passed the per-package directory.
         if (base.isDirectory() && packageName.equals(base.getName()) && looksLikePackageDir(base)) {
@@ -1390,6 +1394,69 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
         // Default: create/use <base>/backup/apps/<pkg>
         return candidate3;
+    }
+
+    /**
+     * Normalizes user-selected backup roots to filesystem paths expected by truebackupd.
+     *
+     * Accepts plain paths and common SAF tree formats:
+     * - content://.../tree/primary:Download
+     * - /tree/primary:Download
+     * - primary:Download
+     */
+    private static String normalizeBasePath(String basePath) {
+        if (basePath == null) return null;
+        String in = basePath.trim();
+        if (in.isEmpty()) return null;
+        if (in.startsWith("/")) {
+            return in;
+        }
+
+        String docId = null;
+        try {
+            if (in.startsWith("content://")) {
+                Uri uri = Uri.parse(in);
+                if (DocumentsContract.isTreeUri(uri)) {
+                    docId = DocumentsContract.getTreeDocumentId(uri);
+                }
+            } else if (in.startsWith("/tree/")) {
+                String tail = in.substring("/tree/".length());
+                int slash = tail.indexOf('/');
+                docId = slash >= 0 ? tail.substring(0, slash) : tail;
+            } else if (in.contains(":")) {
+                docId = in;
+            }
+        } catch (Exception e) {
+            Slog.w(TAG, "normalizeBasePath: failed to parse " + in, e);
+        }
+
+        if (docId == null || docId.isEmpty()) {
+            return in;
+        }
+
+        docId = Uri.decode(docId);
+        int sep = docId.indexOf(':');
+        if (sep < 0) {
+            if ("primary".equals(docId)) {
+                return "/data/media/0";
+            }
+            return in;
+        }
+
+        String volume = docId.substring(0, sep);
+        String relative = docId.substring(sep + 1);
+        if (relative.startsWith("/")) {
+            relative = relative.substring(1);
+        }
+
+        if ("primary".equals(volume)) {
+            if (relative.isEmpty()) return "/data/media/0";
+            return "/data/media/0/" + relative;
+        }
+
+        // Non-primary removable/adopted storage volume IDs.
+        if (relative.isEmpty()) return "/storage/" + volume;
+        return "/storage/" + volume + "/" + relative;
     }
 
     private boolean looksLikePackageDir(File pkgDir) {
