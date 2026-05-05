@@ -2469,8 +2469,7 @@ public final class SystemServer implements Dumpable {
                 t.traceEnd();
             }
 
-            if (context.getResources().getBoolean(R.bool.config_enableWallpaperService)) {
-                t.traceBegin("StartTrueBackup");
+            t.traceBegin("StartTrueBackup");
             try {
                 ServiceManager.addService("truebackup", new TrueBackupService(mSystemContext));
             } catch (Throwable e) {
@@ -2478,8 +2477,8 @@ public final class SystemServer implements Dumpable {
             }
             t.traceEnd();
 
-            t.traceBegin("StartWallpaperManagerService");
-
+            if (context.getResources().getBoolean(R.bool.config_enableWallpaperService)) {
+                t.traceBegin("StartWallpaperManagerService");
                 mSystemServiceManager.startService(WallpaperManagerService.Lifecycle.class);
                 t.traceEnd();
             } else {
