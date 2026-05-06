@@ -109,6 +109,40 @@ static bool EncryptZipInPlace(const std::string& path, const std::string& passwo
 static bool DecryptZipToFile(const std::string& encPath, const std::string& outPath, const std::string& password);
 static bool CanDecryptAnyKnownEncryptedBackup(const std::string& password);
 
+enum class BackupPathClass {
+    kOther = 0,
+    kUserData,
+    kSharedAndroid,
+};
+
+static BackupPathClass ClassifyBackupSource(const std::string& srcDir) {
+    if (android::base::StartsWith(srcDir, "/data/user/")
+            || android::base::StartsWith(srcDir, "/data/user_de/")) {
+        return BackupPathClass::kUserData;
+    }
+    if (android::base::StartsWith(srcDir, "/data/media/")
+            && (srcDir.find("/Android/data/") != std::string::npos
+                    || srcDir.find("/Android/obb/") != std::string::npos
+                    || srcDir.find("/Android/media/") != std::string::npos)) {
+        return BackupPathClass::kSharedAndroid;
+    }
+    return BackupPathClass::kOther;
+}
+
+static bool ShouldSkipForBackupClass(BackupPathClass cls, const std::string& relPrefix,
+                                     const std::string& name) {
+    if (name.empty()) return false;
+    if (cls == BackupPathClass::kUserData && relPrefix.empty()) {
+        return name == ".ota" || name == "cache" || name == "lib"
+                || name == "code_cache" || name == "no_backup";
+    }
+    if (cls == BackupPathClass::kSharedAndroid) {
+        if (relPrefix.empty() && name == "cache") return true;
+        if (android::base::StartsWith(name, "Backup_")) return true;
+    }
+    return false;
+}
+
 static const char* kPasswordPath = "/data/system/truebackup/registration_password.bin";
 /** One path per line; used to find backup trees for password rekey. */
 static const char* kKnownPathsPath = "/data/system/truebackup/known_paths.txt";
@@ -499,7 +533,7 @@ static bool ZipAddFile(ZipWriter& writer, const std::string& absPath, const std:
 }
 
 static bool ZipDirInternal(ZipWriter& writer, const std::string& root, const std::string& current,
-                          const std::string& relPrefix) {
+                          const std::string& relPrefix, BackupPathClass pathClass) {
     DIR* dir = opendir(current.c_str());
     if (!dir) {
         PLOG(ERROR) << "opendir failed: " << current;
@@ -523,6 +557,10 @@ static bool ZipDirInternal(ZipWriter& writer, const std::string& root, const std
             continue;
         }
 
+        if (ShouldSkipForBackupClass(pathClass, relPrefix, de->d_name)) {
+            continue;
+        }
+
         std::string childRel = relPrefix.empty() ? std::string(de->d_name) : (relPrefix + "/" + de->d_name);
 
         if (S_ISDIR(st.st_mode)) {
@@ -535,7 +573,7 @@ static bool ZipDirInternal(ZipWriter& writer, const std::string& root, const std
                 return false;
             }
 
-            if (!ZipDirInternal(writer, root, childAbs, childRel)) {
+            if (!ZipDirInternal(writer, root, childAbs, childRel, pathClass)) {
                 closedir(dir);
                 return false;
             }
@@ -572,7 +610,8 @@ static bool ZipDir(const std::string& srcDir, const std::string& outZip) {
 
     ZipWriter writer(fp);
 
-    bool ok = ZipDirInternal(writer, srcDir, srcDir, "");
+    const BackupPathClass pathClass = ClassifyBackupSource(srcDir);
+    bool ok = ZipDirInternal(writer, srcDir, srcDir, "", pathClass);
     if (!ok) {
         fclose(fp);
         return false;
