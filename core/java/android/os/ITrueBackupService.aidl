@@ -5,8 +5,19 @@ interface ITrueBackupService {
     /** Record the backup base path for future re-encryption. */
     void recordBackupBasePath(String basePath);
 
-    void backupPackage(String packageName, String destPath);
-    void restorePackage(String packageName, String sourcePath);
+    /**
+     * Backs up one package into destPath (TrueBackup tree).
+     * @param userId profile to back up ({@code /data/user/<id>/…}, {@code /data/media/<id>/…}).
+     *        Pass {@code -1} to use the calling user's profile (clone/work profile supported).
+     */
+    void backupPackage(String packageName, String destPath, int userId);
+    /**
+     * Restores one package from destPath (backup base or per-app dir).
+     * @param userId target profile for data restore and install. Pass {@code -1} to use
+     *        {@code backupConfig.userId} from the backup metadata when present, otherwise the
+     *        calling user's profile.
+     */
+    void restorePackage(String packageName, String sourcePath, int userId);
 
     /** Queue deleting one app backup (same worker as backup/restore). */
     void enqueueDeleteBackupPackage(String basePath, String packageName);
