@@ -9,14 +9,17 @@ import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.content.pm.PermissionInfo;
 import android.net.Uri;
+import android.os.Binder;
 import android.os.Environment;
 import android.os.IBinder;
 import android.os.ITrueBackupService;
 import android.os.Parcel;
+import android.os.Process;
 import android.os.RemoteException;
 import android.os.SELinux;
 import android.os.ServiceManager;
 import android.os.UserHandle;
+import android.os.UserManager;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.provider.DocumentsContract;
@@ -76,11 +79,14 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         final String path;
         final String arg1;
         final String arg2;
+        /** Android user id for backup/restore paths (clone/work profile); 0 for delete/rekey. */
+        final int userId;
 
-        QueuedOperation(int type, String packageName, String path) {
+        QueuedOperation(int type, String packageName, String path, int userId) {
             this.type = type;
             this.packageName = packageName;
             this.path = path;
+            this.userId = userId;
             this.arg1 = null;
             this.arg2 = null;
         }
@@ -89,6 +95,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             this.type = type;
             this.packageName = packageName;
             this.path = path;
+            this.userId = 0;
             this.arg1 = arg1;
             this.arg2 = arg2;
         }
@@ -140,21 +147,39 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final String ZIP_MEDIA = "media.zip";
 
 
-    private static final String CE_BASE = "/data/user/0/";
-    private static final String DE_BASE = "/data/user_de/0/";
-    private static final String EXT_DATA_BASE = "/data/media/0/Android/data/";
-    private static final String OBB_BASE = "/data/media/0/Android/obb/";
-    private static final String MEDIA_BASE = "/data/media/0/Android/media/";
-
-    /** Parent dirs whose GID external/OBB/media trees inherit (see DataBackup restoreData). */
-    private static final String EXT_DATA_GID_REF = "/data/media/0/Android/data";
-    private static final String OBB_GID_REF = "/data/media/0/Android/obb";
-    private static final String MEDIA_GID_REF = "/data/media/0/Android/media";
-
     private static final String SETTINGS_FILE_SSAID = "settings_ssaid.xml";
 
-    /** User id for CE/DE paths and permission restore (matches fixed CE_BASE user). */
-    private static final int BACKUP_RESTORE_USER_ID = UserHandle.USER_SYSTEM;
+    private static String ceBase(int userId) {
+        return "/data/user/" + userId + "/";
+    }
+
+    private static String deBase(int userId) {
+        return "/data/user_de/" + userId + "/";
+    }
+
+    private static String extDataBase(int userId) {
+        return "/data/media/" + userId + "/Android/data/";
+    }
+
+    private static String obbBase(int userId) {
+        return "/data/media/" + userId + "/Android/obb/";
+    }
+
+    private static String mediaBase(int userId) {
+        return "/data/media/" + userId + "/Android/media/";
+    }
+
+    private static String extDataGidRef(int userId) {
+        return "/data/media/" + userId + "/Android/data";
+    }
+
+    private static String obbGidRef(int userId) {
+        return "/data/media/" + userId + "/Android/obb";
+    }
+
+    private static String mediaGidRef(int userId) {
+        return "/data/media/" + userId + "/Android/media";
+    }
 
     /** TBK1 magic (format implemented in truebackupd with wrapped master key header). */
     private static final byte[] ENC_MAGIC = new byte[] { 'T', 'B', 'K', '1' };
@@ -174,7 +199,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     }
 
     @Override
-    public void backupPackage(String packageName, String destPath) throws RemoteException {
+    public void backupPackage(String packageName, String destPath, int userId) throws RemoteException {
         checkPermission();
         if (readRegistrationPassword() == null) {
             Slog.w(TAG, "backupPackage: no registration password set");
@@ -184,9 +209,14 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             Slog.w(TAG, "backupPackage: invalid args");
             return;
         }
+        final int resolvedUser = resolveBackupUserId(userId);
+        if (!isUserAlive(resolvedUser)) {
+            Slog.w(TAG, "backupPackage: user not running: " + resolvedUser);
+            return;
+        }
         mWorkInFlight.incrementAndGet();
         try {
-            mOperationQueue.put(new QueuedOperation(OP_BACKUP, packageName, destPath));
+            mOperationQueue.put(new QueuedOperation(OP_BACKUP, packageName, destPath, resolvedUser));
         } catch (InterruptedException e) {
             mWorkInFlight.decrementAndGet();
             Thread.currentThread().interrupt();
@@ -196,7 +226,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     }
 
     @Override
-    public void restorePackage(String packageName, String sourcePath) throws RemoteException {
+    public void restorePackage(String packageName, String sourcePath, int userId) throws RemoteException {
         checkPermission();
         if (readRegistrationPassword() == null) {
             Slog.w(TAG, "restorePackage: no registration password set");
@@ -208,9 +238,14 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
         // Remember this tree so future password changes can rekey existing backups there too.
         recordKnownBackupPath(sourcePath);
+        final int resolvedUser = resolveRestoreUserId(userId, packageName, sourcePath);
+        if (!isUserAlive(resolvedUser)) {
+            Slog.w(TAG, "restorePackage: user not running: " + resolvedUser);
+            return;
+        }
         mWorkInFlight.incrementAndGet();
         try {
-            mOperationQueue.put(new QueuedOperation(OP_RESTORE, packageName, sourcePath));
+            mOperationQueue.put(new QueuedOperation(OP_RESTORE, packageName, sourcePath, resolvedUser));
         } catch (InterruptedException e) {
             mWorkInFlight.decrementAndGet();
             Thread.currentThread().interrupt();
@@ -229,7 +264,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         recordKnownBackupPath(basePath);
         mWorkInFlight.incrementAndGet();
         try {
-            mOperationQueue.put(new QueuedOperation(OP_DELETE, packageName, basePath));
+            mOperationQueue.put(new QueuedOperation(OP_DELETE, packageName, basePath, 0));
         } catch (InterruptedException e) {
             mWorkInFlight.decrementAndGet();
             Thread.currentThread().interrupt();
@@ -411,7 +446,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             try {
                 switch (op.type) {
                     case OP_RESTORE:
-                        executeRestore(op.packageName, op.path);
+                        executeRestore(op.packageName, op.path, op.userId);
                         break;
                     case OP_DELETE:
                         executeDeleteBackup(op.path, op.packageName);
@@ -420,7 +455,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                         executeRekeyAllKnownBackups(op.arg1, op.arg2);
                         break;
                     default:
-                        executeBackup(op.packageName, op.path);
+                        executeBackup(op.packageName, op.path, op.userId);
                         break;
                 }
             } catch (Exception e) {
@@ -436,9 +471,9 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private void executeBackup(String packageName, String destPath) {
+    private void executeBackup(String packageName, String destPath, int userId) {
         try {
-            Slog.d(TAG, "Starting backup for " + packageName + " to " + destPath);
+            Slog.d(TAG, "Starting backup for " + packageName + " user " + userId + " to " + destPath);
             recordKnownBackupPath(destPath);
             final int totalSteps = 7;
             int done = 0;
@@ -453,38 +488,38 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
             // APK
             File apkZip = new File(new File(pkgDir, DIR_APK), ZIP_APK);
-            parts.apk = zipApk(packageName, apkZip);
+            parts.apk = zipApk(packageName, userId, apkZip);
             maybeEncryptInPlace(apkZip);
             setActiveProgressStep(++done, totalSteps);
 
             // Internal data
             File ceZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER);
-            parts.userCe = zipDirIfExists(new File(CE_BASE, packageName), ceZip);
+            parts.userCe = zipDirIfExists(new File(ceBase(userId), packageName), ceZip);
             maybeEncryptInPlace(ceZip);
             setActiveProgressStep(++done, totalSteps);
 
             File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
-            parts.userDe = zipDirIfExists(new File(DE_BASE, packageName), deZip);
+            parts.userDe = zipDirIfExists(new File(deBase(userId), packageName), deZip);
             maybeEncryptInPlace(deZip);
             setActiveProgressStep(++done, totalSteps);
 
             // External data
             File extZip = new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA);
-            parts.extData = zipDirIfExists(new File(EXT_DATA_BASE, packageName), extZip);
+            parts.extData = zipDirIfExists(new File(extDataBase(userId), packageName), extZip);
             maybeEncryptInPlace(extZip);
             setActiveProgressStep(++done, totalSteps);
 
             // Additional
             File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
-            parts.obb = zipDirIfExists(new File(OBB_BASE, packageName), obbZip);
+            parts.obb = zipDirIfExists(new File(obbBase(userId), packageName), obbZip);
             maybeEncryptInPlace(obbZip);
 
             File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
-            parts.media = zipDirIfExists(new File(MEDIA_BASE, packageName), mediaZip);
+            parts.media = zipDirIfExists(new File(mediaBase(userId), packageName), mediaZip);
             maybeEncryptInPlace(mediaZip);
             setActiveProgressStep(++done, totalSteps);
 
-            writeConfig(new File(pkgDir, FILE_CONFIG), packageName, parts);
+            writeConfig(new File(pkgDir, FILE_CONFIG), packageName, userId, parts);
             setActiveProgressStep(++done, totalSteps);
 
             Slog.i(TAG, "Backup finished successfully for " + packageName);
@@ -493,13 +528,13 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private void executeRestore(String packageName, String sourcePath) {
+    private void executeRestore(String packageName, String sourcePath, int userId) {
         try {
-            Slog.d(TAG, "Starting restore for " + packageName + " from " + sourcePath);
+            Slog.d(TAG, "Starting restore for " + packageName + " user " + userId + " from " + sourcePath);
             setActiveOperationProgressPercent(5);
             File pkgDir = resolvePackageBackupDir(sourcePath, packageName);
             if (pkgDir.exists()) {
-                restoreFromPackageDir(packageName, pkgDir);
+                restoreFromPackageDir(packageName, pkgDir, userId);
             } else {
                 Slog.e(TAG, "Source data not found at " + sourcePath);
                 return;
@@ -624,7 +659,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     @Override
     public String getActiveOperationKind() {
         checkPermission();
-        synchronized (this) {
+                synchronized (this) {
             return mActiveOperationKind;
         }
     }
@@ -811,6 +846,72 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
     private void checkPermission() {
         mContext.enforceCallingOrSelfPermission(android.Manifest.permission.BACKUP, "TrueBackup");
+    }
+
+    private static boolean isPrivilegedCallingUid() {
+        final int appId = UserHandle.getAppId(Binder.getCallingUid());
+        return appId == Process.SYSTEM_UID || appId == Process.ROOT_UID;
+    }
+
+    /**
+     * Resolves backup profile: {@code userId >= 0} uses that id when allowed; {@code userId < 0}
+     * uses the calling user's profile (clone/work profile).
+     */
+    private int resolveBackupUserId(int userId) {
+        final int callingUser = UserHandle.getUserId(Binder.getCallingUid());
+        if (userId < 0) {
+            return callingUser;
+        }
+        if (userId != callingUser && !isPrivilegedCallingUid()) {
+            return callingUser;
+        }
+        return userId;
+    }
+
+    /**
+     * Restore target profile: explicit {@code userId >= 0} when allowed; {@code userId < 0} uses
+     * {@code backupConfig.userId} from metadata (Android-DataBackup style), else calling user.
+     */
+    private int resolveRestoreUserId(int userId, String packageName, String sourcePath) {
+        if (userId >= 0) {
+            return resolveBackupUserId(userId);
+        }
+        String json = readBackupMetadataJsonInternal(sourcePath, packageName);
+        if (json != null && !json.isEmpty()) {
+            try {
+                JSONObject root = new JSONObject(json);
+                JSONObject bc = root.optJSONObject("backupConfig");
+                if (bc != null && !bc.isNull("userId")) {
+                    int fromMeta = bc.optInt("userId", -1);
+                    if (fromMeta >= 0) {
+                        return fromMeta;
+                    }
+                }
+            } catch (Exception e) {
+                Slog.w(TAG, "resolveRestoreUserId: metadata", e);
+            }
+        }
+        return UserHandle.getUserId(Binder.getCallingUid());
+    }
+
+    private boolean isUserAlive(int userId) {
+        UserManager um = mContext.getSystemService(UserManager.class);
+        if (um == null) {
+            return userId == UserHandle.USER_SYSTEM;
+        }
+        return um.isUserRunning(userId);
+    }
+
+    private Context getContextForUser(int userId) {
+        if (userId == UserHandle.getUserId(Process.myUid())) {
+            return mContext;
+        }
+        try {
+            return mContext.createContextAsUser(UserHandle.of(userId), 0);
+        } catch (Exception e) {
+            Slog.w(TAG, "createContextAsUser failed for " + userId, e);
+            return mContext;
+        }
     }
 
     private File getTrueBackupSystemDir() {
@@ -1172,9 +1273,9 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private boolean isPackageInstalled(String packageName) {
+    private boolean isPackageInstalledAsUser(String packageName, int userId) {
         try {
-            mContext.getPackageManager().getPackageInfo(packageName, 0);
+            mContext.getPackageManager().getPackageInfoAsUser(packageName, 0, userId);
             return true;
         } catch (PackageManager.NameNotFoundException e) {
             return false;
@@ -1203,8 +1304,9 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private void installApksFromBackupIfNeeded(String packageName, File pkgDir) throws IOException {
-        if (isPackageInstalled(packageName)) {
+    private void installApksFromBackupIfNeeded(String packageName, File pkgDir, int userId)
+            throws IOException {
+        if (isPackageInstalledAsUser(packageName, userId)) {
             return;
         }
 
@@ -1234,8 +1336,9 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
 
         try {
-            // Install via PackageInstaller session (supports splits).
-            PackageManager pm = mContext.getPackageManager();
+            // Install via PackageInstaller session for the target profile (clone / work user).
+            Context userCtx = getContextForUser(userId);
+            PackageManager pm = userCtx.getPackageManager();
             PackageInstaller installer = pm.getPackageInstaller();
             PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
                     PackageInstaller.SessionParams.MODE_FULL_INSTALL);
@@ -1281,7 +1384,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
                         PackageInstaller.STATUS_FAILURE);
                 if (status != PackageInstaller.STATUS_SUCCESS) {
                     String msg = result.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
-                    throw new IOException("Install failed for " + packageName + ": status=" + status + " msg=" + msg);
+                    throw new IOException("Install failed for " + packageName + ": status=" + status
+                            + " msg=" + msg);
                 }
             } finally {
                 session.close();
@@ -1296,9 +1400,9 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             }
         }
 
-        // Verify installed.
-        if (!isPackageInstalled(packageName)) {
-            throw new IOException("Install reported success but package not installed: " + packageName);
+        if (!isPackageInstalledAsUser(packageName, userId)) {
+            throw new IOException("Install reported success but package not installed for user "
+                    + userId + ": " + packageName);
         }
     }
 
@@ -1534,13 +1638,13 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private boolean zipApk(String packageName, File outZip) throws IOException {
+    private boolean zipApk(String packageName, int userId, File outZip) throws IOException {
         PackageManager pm = mContext.getPackageManager();
         ApplicationInfo ai;
         try {
-            ai = pm.getApplicationInfo(packageName, 0);
+            ai = pm.getApplicationInfoAsUser(packageName, 0, UserHandle.of(userId));
         } catch (PackageManager.NameNotFoundException e) {
-            Slog.e(TAG, "Package not found: " + packageName);
+            Slog.e(TAG, "Package not found: " + packageName + " user " + userId);
             return false;
         }
 
@@ -1579,18 +1683,18 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         return zipDirectoryWithDaemon(sourceDir, outZip);
     }
 
-    private void restoreFromPackageDir(String packageName, File pkgDir) throws IOException {
+    private void restoreFromPackageDir(String packageName, File pkgDir, int userId) throws IOException {
         final int totalSteps = 7;
         int done = 0;
         // If the app is not installed, install it first from apk.zip so /data_mirror targets exist.
-        installApksFromBackupIfNeeded(packageName, pkgDir);
+        installApksFromBackupIfNeeded(packageName, pkgDir, userId);
         setActiveProgressStep(++done, totalSteps);
 
-        final int appUid = getApplicationUidOrThrow(packageName);
+        final int appUid = getApplicationUidOrThrow(packageName, userId);
 
         File ceZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER);
         if (ceZip.exists()) {
-            File target = new File(CE_BASE, packageName);
+            File target = new File(ceBase(userId), packageName);
             unzipToDirMaybeDaemon(ceZip, target);
             fixupRestoredTree(target, appUid, appUid, -1);
         }
@@ -1598,7 +1702,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
         File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
         if (deZip.exists()) {
-            File target = new File(DE_BASE, packageName);
+            File target = new File(deBase(userId), packageName);
             unzipToDirMaybeDaemon(deZip, target);
             fixupRestoredTree(target, appUid, appUid, -1);
         }
@@ -1606,41 +1710,42 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
         File extZip = new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA);
         if (extZip.exists()) {
-            File target = new File(EXT_DATA_BASE, packageName);
+            File target = new File(extDataBase(userId), packageName);
             unzipToDirMaybeDaemon(extZip, target);
-            int extGid = statDirGidOrUid(EXT_DATA_GID_REF, appUid);
+            int extGid = statDirGidOrUid(extDataGidRef(userId), appUid);
             fixupRestoredTree(target, appUid, extGid, MODE_ANDROID_DATA_DIR);
         }
         setActiveProgressStep(++done, totalSteps);
 
         File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
         if (obbZip.exists()) {
-            File target = new File(OBB_BASE, packageName);
+            File target = new File(obbBase(userId), packageName);
             unzipToDirMaybeDaemon(obbZip, target);
-            int obbGid = statDirGidOrUid(OBB_GID_REF, appUid);
+            int obbGid = statDirGidOrUid(obbGidRef(userId), appUid);
             fixupRestoredTree(target, appUid, obbGid, MODE_ANDROID_SHARED_PKG_DIR);
         }
         setActiveProgressStep(++done, totalSteps);
 
         File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
         if (mediaZip.exists()) {
-            File target = new File(MEDIA_BASE, packageName);
+            File target = new File(mediaBase(userId), packageName);
             unzipToDirMaybeDaemon(mediaZip, target);
-            int mediaGid = statDirGidOrUid(MEDIA_GID_REF, appUid);
+            int mediaGid = statDirGidOrUid(mediaGidRef(userId), appUid);
             fixupRestoredTree(target, appUid, mediaGid, MODE_ANDROID_SHARED_PKG_DIR);
         }
         setActiveProgressStep(++done, totalSteps);
 
-        applySecurityRestoreFromConfig(packageName, pkgDir);
+        applySecurityRestoreFromConfig(packageName, pkgDir, userId);
         setActiveProgressStep(++done, totalSteps);
     }
 
-    private int getApplicationUidOrThrow(String packageName) throws IOException {
+    private int getApplicationUidOrThrow(String packageName, int userId) throws IOException {
         try {
-            ApplicationInfo ai = mContext.getPackageManager().getApplicationInfo(packageName, 0);
+            ApplicationInfo ai = mContext.getPackageManager().getApplicationInfoAsUser(
+                    packageName, 0, UserHandle.of(userId));
             return ai.uid;
         } catch (PackageManager.NameNotFoundException e) {
-            throw new IOException("Package not installed: " + packageName, e);
+            throw new IOException("Package not installed: " + packageName + " user " + userId, e);
         }
     }
 
@@ -1820,7 +1925,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private void writeConfig(File outConfig, String packageName, BackupParts parts)
+    private void writeConfig(File outConfig, String packageName, int userId, BackupParts parts)
             throws IOException, JSONException {
         final long now = System.currentTimeMillis();
         final PackageManager pm = mContext.getPackageManager();
@@ -1828,7 +1933,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         PackageInfo pi = null;
         ApplicationInfo ai = null;
         try {
-            pi = pm.getPackageInfo(packageName, PackageManager.GET_PERMISSIONS);
+            pi = pm.getPackageInfoAsUser(packageName, PackageManager.GET_PERMISSIONS, userId);
             ai = pi.applicationInfo;
         } catch (PackageManager.NameNotFoundException e) {
             // Keep config generation best-effort.
@@ -1867,7 +1972,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
         JSONObject backupConfig = new JSONObject();
         backupConfig.put("packageName", packageName);
-        backupConfig.put("userId", 0);
+        backupConfig.put("userId", userId);
         backupConfig.put("compression", "zip");
         backupConfig.put("preserveId", now);
         File pkgDir = outConfig.getParentFile();
@@ -1897,11 +2002,11 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
         JSONObject security = new JSONObject();
         if (ai != null) security.put("uid", ai.uid);
-        String ssaidHex = (ai != null) ? readSsaidHexFromDisk(BACKUP_RESTORE_USER_ID, ai.uid) : null;
+        String ssaidHex = (ai != null) ? readSsaidHexFromDisk(userId, ai.uid) : null;
         if (ssaidHex != null && !ssaidHex.isEmpty()) {
             security.put("ssaid", ssaidHex);
         } else {
-            security.put("ssaid", JSONObject.NULL);
+        security.put("ssaid", JSONObject.NULL);
         }
         security.put("keystore", "unknown");
         security.put("appops", buildAppOpsJson(packageName, ai != null ? ai.uid : -1));
@@ -1996,7 +2101,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         return arr;
     }
 
-    private void applySecurityRestoreFromConfig(String packageName, File pkgDir) {
+    private void applySecurityRestoreFromConfig(String packageName, File pkgDir, int userId) {
         File cfg = new File(pkgDir, FILE_CONFIG);
         if (!cfg.isFile()) {
             return;
@@ -2004,7 +2109,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         try {
             String json = new String(readFully(cfg), StandardCharsets.UTF_8);
             JSONObject root = new JSONObject(json);
-            applySecurityFromJson(packageName, root.optJSONObject("security"));
+            applySecurityFromJson(packageName, root.optJSONObject("security"), userId);
         } catch (Exception e) {
             Slog.w(TAG, "Security restore skipped for " + packageName, e);
         }
@@ -2015,7 +2120,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
      * SSAID is stored in backups when readable from disk but cannot be written back safely from
      * system_server without a dedicated Settings API.
      */
-    private void applySecurityFromJson(String packageName, JSONObject security) {
+    private void applySecurityFromJson(String packageName, JSONObject security, int userId) {
         if (security == null) {
             return;
         }
@@ -2029,20 +2134,20 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
         int uid;
         try {
-            uid = getApplicationUidOrThrow(packageName);
+            uid = getApplicationUidOrThrow(packageName, userId);
         } catch (IOException e) {
             Slog.w(TAG, "Security restore: package not installed " + packageName);
             return;
         }
 
         try {
-            resetAppOpsForPackage(BACKUP_RESTORE_USER_ID, packageName);
+            resetAppOpsForPackage(userId, packageName);
         } catch (RemoteException e) {
             Slog.w(TAG, "reset app ops failed for " + packageName, e);
         }
 
         PackageManager pm = mContext.getPackageManager();
-        UserHandle user = UserHandle.of(BACKUP_RESTORE_USER_ID);
+        UserHandle user = UserHandle.of(userId);
         JSONArray perms = security.optJSONArray("permissions");
         if (perms != null) {
             for (int i = 0; i < perms.length(); i++) {
