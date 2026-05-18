@@ -21,9 +21,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <openssl/evp.h>
-#include <openssl/mem.h>
-#include <openssl/rand.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -38,10 +35,9 @@
 #include <string>
 #include <vector>
 
-#include <ziparchive/zip_archive.h>
-#include <ziparchive/zip_writer.h>
-
 #include <android-base/unique_fd.h>
+
+#include "truebackup_archive.h"
 
 namespace {
 
@@ -49,11 +45,11 @@ constexpr const char* kServiceName = "truebackupd";
 constexpr uint32_t kInterfaceToken = 0x5452424b;  // 'TRBK'
 
 enum Transaction : uint32_t {
-    ZIP_DIR = android::IBinder::FIRST_CALL_TRANSACTION,
-    UNZIP_TO_DIR = android::IBinder::FIRST_CALL_TRANSACTION + 1,
+    TAR_DIR = android::IBinder::FIRST_CALL_TRANSACTION,
+    UNTAR_TO_DIR = android::IBinder::FIRST_CALL_TRANSACTION + 1,
     MKDIRS = android::IBinder::FIRST_CALL_TRANSACTION + 2,
-    ZIP_SINGLE_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 3,
-    ZIP_MULTI_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 4,
+    TAR_SINGLE_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 3,
+    TAR_MULTI_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 4,
     WRITE_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 5,
     /** Recursive chown + recursive setfilecon(context). */
     CHOWN_AND_CHCON = android::IBinder::FIRST_CALL_TRANSACTION + 13,
@@ -63,13 +59,13 @@ enum Transaction : uint32_t {
     SET_PASSWORD = android::IBinder::FIRST_CALL_TRANSACTION + 8,
     /** Read TrueBackup registration password (fixed location under /data/system/truebackup). */
     GET_PASSWORD = android::IBinder::FIRST_CALL_TRANSACTION + 9,
-    /** Encrypt a plain file in place (TBK1 container with wrapped master key). */
-    ENCRYPT_ZIP_IN_PLACE = android::IBinder::FIRST_CALL_TRANSACTION + 10,
-    /** Decrypt TBK1 file to a new path. */
-    DECRYPT_ZIP_TO_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 11,
+    /** Encrypt a plain tar archive in place (TBK2: salt + iv + AES-256-CBC). */
+    ENCRYPT_ARCHIVE_IN_PLACE = android::IBinder::FIRST_CALL_TRANSACTION + 10,
+    /** Decrypt TBK2 archive to a plain tar file. */
+    DECRYPT_ARCHIVE_TO_FILE = android::IBinder::FIRST_CALL_TRANSACTION + 11,
     /** Change registration password (requires old password). */
     CHANGE_PASSWORD = android::IBinder::FIRST_CALL_TRANSACTION + 12,
-    /** Recursively re-encrypt zip backups under a directory tree. */
+    /** Recursively re-encrypt backup archives under a directory tree. */
     REKEY_BACKUP_TREE = android::IBinder::FIRST_CALL_TRANSACTION + 14,
     /** Append a backup base path to known_paths.txt (daemon-owned; system_server cannot write). */
     APPEND_KNOWN_BACKUP_PATH = android::IBinder::FIRST_CALL_TRANSACTION + 15,
@@ -88,11 +84,9 @@ static std::string Dirname(const std::string& path) {
 
 static bool EnsureDir(const std::string& path, mode_t mode);
 static bool EnsureDir(const std::string& path) { return EnsureDir(path, 0755); }
-static bool ZipAddFile(ZipWriter& writer, const std::string& absPath, const std::string& relPath);
-static bool ZipDir(const std::string& srcDir, const std::string& outZip);
-static bool UnzipToDir(const std::string& zipPath, const std::string& outDir);
+static bool TarDir(const std::string& srcDir, const std::string& outPath);
+static bool UntarToDir(const std::string& archivePath, const std::string& outDir);
 static bool IsDotOrDotDot(const char* name);
-static bool IsPathTraversal(const std::string& entryName);
 static bool ChownRecursive(const std::string& path, uid_t uid, gid_t gid);
 static bool ChmodRecursive(const std::string& path, mode_t mode);
 static bool SetfileconRecursive(const std::string& path, const std::string& context);
@@ -101,47 +95,14 @@ static bool FixupOwnershipAndContext(const std::string& path, int32_t uid, int32
 static bool RemoveTree(const std::string& path);
 static bool WriteFileAtomic(const std::string& outPath, const uint8_t* data, size_t dataLen);
 static bool RekeyBackupTree(const std::string& dir, const std::string& oldPw, const std::string& newPw);
-static bool RekeyZipFile(const std::string& zipPath, const std::string& oldPw, const std::string& newPw);
+static bool RekeyArchiveFile(const std::string& path, const std::string& oldPw, const std::string& newPw);
 static bool IsEncryptedFilePath(const std::string& path);
-static bool HasEncryptedBackupZip(const std::string& dir, std::string* outZipPath);
+static bool HasEncryptedBackupArchive(const std::string& dir, std::string* outPath);
 static bool MakeTempPathInTmpDir(std::string* outPath);
-static bool EncryptZipInPlace(const std::string& path, const std::string& password);
-static bool DecryptZipToFile(const std::string& encPath, const std::string& outPath, const std::string& password);
+static bool EncryptArchiveInPlace(const std::string& path, const std::string& password);
+static bool DecryptArchiveToFile(const std::string& encPath, const std::string& outPath,
+                                 const std::string& password);
 static bool CanDecryptAnyKnownEncryptedBackup(const std::string& password);
-
-enum class BackupPathClass {
-    kOther = 0,
-    kUserData,
-    kSharedAndroid,
-};
-
-static BackupPathClass ClassifyBackupSource(const std::string& srcDir) {
-    if (android::base::StartsWith(srcDir, "/data/user/")
-            || android::base::StartsWith(srcDir, "/data/user_de/")) {
-        return BackupPathClass::kUserData;
-    }
-    if (android::base::StartsWith(srcDir, "/data/media/")
-            && (srcDir.find("/Android/data/") != std::string::npos
-                    || srcDir.find("/Android/obb/") != std::string::npos
-                    || srcDir.find("/Android/media/") != std::string::npos)) {
-        return BackupPathClass::kSharedAndroid;
-    }
-    return BackupPathClass::kOther;
-}
-
-static bool ShouldSkipForBackupClass(BackupPathClass cls, const std::string& relPrefix,
-                                     const std::string& name) {
-    if (name.empty()) return false;
-    if (cls == BackupPathClass::kUserData && relPrefix.empty()) {
-        return name == ".ota" || name == "cache" || name == "lib"
-                || name == "code_cache" || name == "no_backup";
-    }
-    if (cls == BackupPathClass::kSharedAndroid) {
-        if (relPrefix.empty() && name == "cache") return true;
-        if (android::base::StartsWith(name, "Backup_")) return true;
-    }
-    return false;
-}
 
 static const char* kPasswordPath = "/data/system/truebackup/registration_password.bin";
 /** One path per line; used to find backup trees for password rekey. */
@@ -267,14 +228,14 @@ static bool IsLikelyBackupAppsDir(const std::string& path) {
     return android::base::EndsWith(path, "/apps") || path == "apps";
 }
 
-static bool HasEncryptedBackupZip(const std::string& dir, std::string* outZipPath) {
+static bool HasEncryptedBackupArchive(const std::string& dir, std::string* outPath) {
     struct stat st;
     if (lstat(dir.c_str(), &st) != 0) return false;
     if (S_ISLNK(st.st_mode)) return false;
     if (!S_ISDIR(st.st_mode)) {
-        if (!android::base::EndsWith(dir, ".zip")) return false;
+        if (!android::base::EndsWith(dir, ".tbak")) return false;
         if (!IsEncryptedFilePath(dir)) return false;
-        if (outZipPath) *outZipPath = dir;
+        if (outPath) *outPath = dir;
         return true;
     }
 
@@ -285,7 +246,7 @@ static bool HasEncryptedBackupZip(const std::string& dir, std::string* outZipPat
     while (!found && (de = readdir(d)) != nullptr) {
         if (IsDotOrDotDot(de->d_name)) continue;
         const std::string child = dir + "/" + de->d_name;
-        if (HasEncryptedBackupZip(child, outZipPath)) {
+        if (HasEncryptedBackupArchive(child, outPath)) {
             found = true;
         }
     }
@@ -309,12 +270,12 @@ static bool CanDecryptAnyKnownEncryptedBackup(const std::string& password) {
         }
     }
 
-    std::string encZip;
+    std::string encPath;
     for (const auto& c : candidates) {
-        if (HasEncryptedBackupZip(c, &encZip)) {
+        if (HasEncryptedBackupArchive(c, &encPath)) {
             std::string tmpOut;
             if (!MakeTempPathInTmpDir(&tmpOut)) return false;
-            const bool ok = DecryptZipToFile(encZip, tmpOut, password);
+            const bool ok = DecryptArchiveToFile(encPath, tmpOut, password);
             (void)unlink(tmpOut.c_str());
             return ok;
         }
@@ -322,100 +283,16 @@ static bool CanDecryptAnyKnownEncryptedBackup(const std::string& password) {
     return true;  // no encrypted backup found => allow first set
 }
 
-static bool ZipSingleFileToZip(const std::string& srcFile, const std::string& outZip,
-                               const std::string& entryName) {
-    struct stat st;
-    if (stat(srcFile.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
-        LOG(ERROR) << "Source not a regular file: " << srcFile;
-        return false;
-    }
-
-    std::string outParent = Dirname(outZip);
-    if (!EnsureDir(outParent)) {
-        LOG(ERROR) << "Failed to create parent dir: " << outParent;
-        return false;
-    }
-
-    FILE* fp = fopen(outZip.c_str(), "wb");
-    if (!fp) {
-        PLOG(ERROR) << "fopen failed: " << outZip;
-        return false;
-    }
-
-    ZipWriter writer(fp);
-    bool ok = ZipAddFile(writer, srcFile, entryName);
-    if (!ok) {
-        fclose(fp);
-        return false;
-    }
-
-    if (writer.Finish() != 0) {
-        LOG(ERROR) << "ZipWriter::Finish failed";
-        fclose(fp);
-        return false;
-    }
-
-    fclose(fp);
-    return true;
+static bool TarSingleFile(const std::string& srcFile, const std::string& outPath,
+                          const std::string& entryName) {
+    std::vector<std::pair<std::string, std::string>> files;
+    files.emplace_back(srcFile, entryName);
+    return truebackup::TarFiles(files, outPath);
 }
 
-static bool ZipMultiFileToZip(const std::vector<std::pair<std::string, std::string>>& files,
-                              const std::string& outZip) {
-    if (files.empty()) {
-        LOG(ERROR) << "No files to zip";
-        return false;
-    }
-
-    std::string outParent = Dirname(outZip);
-    if (!EnsureDir(outParent)) {
-        LOG(ERROR) << "Failed to create parent dir: " << outParent;
-        return false;
-    }
-
-    FILE* fp = fopen(outZip.c_str(), "wb");
-    if (!fp) {
-        PLOG(ERROR) << "fopen failed: " << outZip;
-        return false;
-    }
-
-    ZipWriter writer(fp);
-    for (const auto& it : files) {
-        const std::string& srcFile = it.first;
-        const std::string& entryName = it.second;
-
-        if (entryName.empty()) {
-            LOG(ERROR) << "Empty entry name for: " << srcFile;
-            fclose(fp);
-            return false;
-        }
-
-        if (IsPathTraversal(entryName)) {
-            LOG(ERROR) << "Rejected entry path: " << entryName;
-            fclose(fp);
-            return false;
-        }
-
-        struct stat st;
-        if (stat(srcFile.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
-            LOG(ERROR) << "Source not a regular file: " << srcFile;
-            fclose(fp);
-            return false;
-        }
-
-        if (!ZipAddFile(writer, srcFile, entryName)) {
-            fclose(fp);
-            return false;
-        }
-    }
-
-    if (writer.Finish() != 0) {
-        LOG(ERROR) << "ZipWriter::Finish failed";
-        fclose(fp);
-        return false;
-    }
-
-    fclose(fp);
-    return true;
+static bool TarMultiFile(const std::vector<std::pair<std::string, std::string>>& files,
+                         const std::string& outPath) {
+    return truebackup::TarFiles(files, outPath);
 }
 
 static bool EnsureDir(const std::string& path, mode_t mode) {
@@ -474,236 +351,16 @@ static bool IsDotOrDotDot(const char* name) {
     return (strcmp(name, ".") == 0) || (strcmp(name, "..") == 0);
 }
 
-static bool IsPathTraversal(const std::string& entryName) {
-    if (entryName.empty()) return true;
-    if (entryName[0] == '/') return true;
-    if (entryName.find("..") == std::string::npos) return false;
-
-    // Conservative check: reject any path segment == "..".
-    size_t start = 0;
-    while (start < entryName.size()) {
-        size_t end = entryName.find('/', start);
-        if (end == std::string::npos) end = entryName.size();
-        std::string seg = entryName.substr(start, end - start);
-        if (seg == "..") return true;
-        start = end + 1;
-    }
-    return false;
+static bool TarDir(const std::string& srcDir, const std::string& outPath) {
+    return truebackup::TarDirectory(srcDir, outPath, truebackup::ClassifyBackupSource(srcDir));
 }
 
-static bool ZipAddFile(ZipWriter& writer, const std::string& absPath, const std::string& relPath) {
-    android::base::unique_fd fd(open(absPath.c_str(), O_RDONLY | O_CLOEXEC));
-    if (fd.get() < 0) {
-        PLOG(ERROR) << "open failed: " << absPath;
+static bool UntarToDir(const std::string& archivePath, const std::string& outDir) {
+    if (truebackup::IsEncryptedArchivePath(archivePath)) {
+        LOG(ERROR) << "UntarToDir: encrypted archive must be decrypted first: " << archivePath;
         return false;
     }
-
-    struct stat st;
-    if (fstat(fd.get(), &st) != 0) {
-        PLOG(ERROR) << "fstat failed: " << absPath;
-        return false;
-    }
-
-    if (writer.StartEntry(relPath, ZipWriter::kCompress) != 0) {
-        LOG(ERROR) << "StartEntry failed: " << relPath;
-        return false;
-    }
-
-    std::vector<uint8_t> buf(128 * 1024);
-    ssize_t n;
-    while ((n = read(fd.get(), buf.data(), buf.size())) > 0) {
-        if (writer.WriteBytes(buf.data(), static_cast<size_t>(n)) != 0) {
-            LOG(ERROR) << "WriteBytes failed for " << relPath;
-            return false;
-        }
-    }
-
-    if (n < 0) {
-        PLOG(ERROR) << "read failed: " << absPath;
-        return false;
-    }
-
-    if (writer.FinishEntry() != 0) {
-        LOG(ERROR) << "FinishEntry failed: " << relPath;
-        return false;
-    }
-
-    (void)st;
-    return true;
-}
-
-static bool ZipDirInternal(ZipWriter& writer, const std::string& root, const std::string& current,
-                          const std::string& relPrefix, BackupPathClass pathClass) {
-    DIR* dir = opendir(current.c_str());
-    if (!dir) {
-        PLOG(ERROR) << "opendir failed: " << current;
-        return false;
-    }
-
-    dirent* de;
-    while ((de = readdir(dir)) != nullptr) {
-        if (IsDotOrDotDot(de->d_name)) continue;
-
-        std::string childAbs = current + "/" + de->d_name;
-        struct stat st;
-        if (lstat(childAbs.c_str(), &st) != 0) {
-            PLOG(ERROR) << "lstat failed: " << childAbs;
-            closedir(dir);
-            return false;
-        }
-
-        // Skip symlinks for safety.
-        if (S_ISLNK(st.st_mode)) {
-            continue;
-        }
-
-        if (ShouldSkipForBackupClass(pathClass, relPrefix, de->d_name)) {
-            continue;
-        }
-
-        std::string childRel = relPrefix.empty() ? std::string(de->d_name) : (relPrefix + "/" + de->d_name);
-
-        if (S_ISDIR(st.st_mode)) {
-            // Create a directory entry in the zip.
-            std::string dirEntry = childRel;
-            if (!android::base::EndsWith(dirEntry, "/")) dirEntry += "/";
-            if (writer.StartEntry(dirEntry, 0) != 0 || writer.FinishEntry() != 0) {
-                LOG(ERROR) << "Failed to add dir entry: " << dirEntry;
-                closedir(dir);
-                return false;
-            }
-
-            if (!ZipDirInternal(writer, root, childAbs, childRel, pathClass)) {
-                closedir(dir);
-                return false;
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            if (!ZipAddFile(writer, childAbs, childRel)) {
-                closedir(dir);
-                return false;
-            }
-        }
-    }
-
-    closedir(dir);
-    return true;
-}
-
-static bool ZipDir(const std::string& srcDir, const std::string& outZip) {
-    struct stat st;
-    if (stat(srcDir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
-        LOG(ERROR) << "Source not a directory: " << srcDir;
-        return false;
-    }
-
-    std::string outParent = Dirname(outZip);
-    if (!EnsureDir(outParent)) {
-        LOG(ERROR) << "Failed to create parent dir: " << outParent;
-        return false;
-    }
-
-    FILE* fp = fopen(outZip.c_str(), "wb");
-    if (!fp) {
-        PLOG(ERROR) << "fopen failed: " << outZip;
-        return false;
-    }
-
-    ZipWriter writer(fp);
-
-    const BackupPathClass pathClass = ClassifyBackupSource(srcDir);
-    bool ok = ZipDirInternal(writer, srcDir, srcDir, "", pathClass);
-    if (!ok) {
-        fclose(fp);
-        return false;
-    }
-
-    if (writer.Finish() != 0) {
-        LOG(ERROR) << "ZipWriter::Finish failed";
-        fclose(fp);
-        return false;
-    }
-
-    fclose(fp);
-    return true;
-}
-
-static bool UnzipToDir(const std::string& zipPath, const std::string& outDir) {
-    if (!EnsureDir(outDir)) {
-        LOG(ERROR) << "Failed to create output dir: " << outDir;
-        return false;
-    }
-
-    ZipArchiveHandle handle;
-    int32_t openErr = OpenArchive(zipPath.c_str(), &handle);
-    if (openErr != 0) {
-        LOG(ERROR) << "OpenArchive failed: " << zipPath << " err=" << openErr;
-        return false;
-    }
-
-    void* cookie = nullptr;
-    int32_t itErr = StartIteration(handle, &cookie);
-    if (itErr != 0) {
-        LOG(ERROR) << "StartIteration failed: " << zipPath << " err=" << itErr;
-        CloseArchive(handle);
-        return false;
-    }
-
-    ZipEntry64 entry;
-    std::string name;
-    int32_t nextErr;
-    while ((nextErr = Next(cookie, &entry, &name)) == 0) {
-        if (IsPathTraversal(name)) {
-            LOG(ERROR) << "Rejected zip entry path: " << name;
-            EndIteration(cookie);
-            CloseArchive(handle);
-            return false;
-        }
-
-        std::string outPath = outDir + "/" + name;
-
-        if (android::base::EndsWith(name, "/")) {
-            if (!EnsureDir(outPath)) {
-                LOG(ERROR) << "Failed to mkdir: " << outPath;
-                EndIteration(cookie);
-                CloseArchive(handle);
-                return false;
-            }
-            continue;
-        }
-
-        if (!EnsureDir(Dirname(outPath))) {
-            LOG(ERROR) << "Failed to mkdir parent: " << outPath;
-            EndIteration(cookie);
-            CloseArchive(handle);
-            return false;
-        }
-
-        android::base::unique_fd fd(open(outPath.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644));
-        if (fd.get() < 0) {
-            PLOG(ERROR) << "open out failed: " << outPath;
-            EndIteration(cookie);
-            CloseArchive(handle);
-            return false;
-        }
-
-        int32_t exErr = ExtractEntryToFile(handle, &entry, fd.get());
-        if (exErr != 0) {
-            LOG(ERROR) << "ExtractEntryToFile failed entry=" << name << " err=" << exErr;
-            EndIteration(cookie);
-            CloseArchive(handle);
-            return false;
-        }
-    }
-
-    EndIteration(cookie);
-    CloseArchive(handle);
-
-    if (nextErr != -1) {
-        LOG(ERROR) << "Iteration ended with err=" << nextErr;
-        return false;
-    }
-
-    return true;
+    return truebackup::UntarToDirectory(archivePath, outDir);
 }
 
 static bool ChownRecursive(const std::string& path, uid_t uid, gid_t gid) {
@@ -827,90 +484,29 @@ static bool FixupOwnershipAndContext(const std::string& path, int32_t uid32, int
 }
 
 static bool IsEncryptedFilePath(const std::string& path) {
-    android::base::unique_fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
-    if (fd.get() < 0) return false;
-    uint8_t m[4];
-    ssize_t n = read(fd.get(), m, sizeof(m));
-    if (n != static_cast<ssize_t>(sizeof(m))) return false;
-    static const uint8_t kMagic[4] = {'T', 'B', 'K', '1'};
-    return memcmp(m, kMagic, sizeof(kMagic)) == 0;
+    return truebackup::IsEncryptedArchivePath(path);
 }
 
-static bool CopyFileContents(const std::string& src, const std::string& dst, mode_t* priorModeOut) {
-    if (priorModeOut) {
-        struct stat st;
-        if (stat(dst.c_str(), &st) == 0) {
-            *priorModeOut = st.st_mode & 07777u;
-        } else {
-            *priorModeOut = 0;
-        }
-    }
+static bool RekeyArchiveFile(const std::string& path, const std::string& oldPw, const std::string& newPw) {
+    return truebackup::ReEncryptArchiveFile(path, oldPw, newPw);
+}
 
-    android::base::unique_fd in(open(src.c_str(), O_RDONLY | O_CLOEXEC));
-    if (in.get() < 0) {
-        PLOG(ERROR) << "open src failed: " << src;
+static bool EncryptArchiveInPlace(const std::string& path, const std::string& password) {
+    return truebackup::EncryptTarInPlace(path, password);
+}
+
+static bool DecryptArchiveToFile(const std::string& encPath, const std::string& outPath,
+                                 const std::string& password) {
+    if (!truebackup::DecryptToPlainTar(encPath, outPath, password)) {
         return false;
     }
-
-    // Best-effort replace destination (cross-filesystem rename won't work for /data/system/tmp -> /storage).
-    (void)unlink(dst.c_str());
-    android::base::unique_fd out(open(dst.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644));
-    if (out.get() < 0) {
-        PLOG(ERROR) << "open dst failed: " << dst;
-        return false;
-    }
-
-    std::vector<uint8_t> buf(256 * 1024);
-    while (true) {
-        ssize_t n = read(in.get(), buf.data(), buf.size());
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            PLOG(ERROR) << "read failed: " << src;
-            return false;
-        }
-        if (n == 0) break;
-        size_t written = 0;
-        while (written < static_cast<size_t>(n)) {
-            ssize_t w = write(out.get(), buf.data() + written, static_cast<size_t>(n) - written);
-            if (w < 0) {
-                if (errno == EINTR) continue;
-                PLOG(ERROR) << "write failed: " << dst;
-                return false;
-            }
-            written += static_cast<size_t>(w);
+    const std::string prefix = std::string(kTrueBackupTmpDir) + "/";
+    if (outPath.size() > prefix.size() && outPath.compare(0, prefix.size(), prefix) == 0) {
+        if (chmod(outPath.c_str(), 0644) != 0) {
+            PLOG(WARNING) << "chmod decrypted tmp: " << outPath;
         }
     }
     return true;
-}
-
-static bool RekeyZipFile(const std::string& zipPath, const std::string& oldPw, const std::string& newPw) {
-    if (zipPath.empty() || zipPath[0] != '/' || newPw.empty()) return false;
-    if (!android::base::EndsWith(zipPath, ".zip")) return true;
-
-    const bool encrypted = IsEncryptedFilePath(zipPath);
-    if (!encrypted) {
-        return EncryptZipInPlace(zipPath, newPw);
-    }
-    if (oldPw.empty()) {
-        LOG(WARNING) << "RekeyZipFile: old password missing for " << zipPath;
-        return false;
-    }
-
-    std::string tmpPlain;
-    if (!MakeTempPathInTmpDir(&tmpPlain)) return false;
-
-    bool ok = false;
-    mode_t priorMode = 0;
-    do {
-        if (!DecryptZipToFile(zipPath, tmpPlain, oldPw)) break;
-        if (!CopyFileContents(tmpPlain, zipPath, &priorMode)) break;
-        if (priorMode != 0) (void)chmod(zipPath.c_str(), priorMode);
-        if (!EncryptZipInPlace(zipPath, newPw)) break;
-        ok = true;
-    } while (false);
-
-    (void)unlink(tmpPlain.c_str());
-    return ok;
 }
 
 static bool RekeyBackupTree(const std::string& dir, const std::string& oldPw, const std::string& newPw) {
@@ -921,7 +517,7 @@ static bool RekeyBackupTree(const std::string& dir, const std::string& oldPw, co
         return false;
     }
     if (S_ISLNK(st.st_mode)) return true;
-    if (!S_ISDIR(st.st_mode)) return RekeyZipFile(dir, oldPw, newPw);
+    if (!S_ISDIR(st.st_mode)) return RekeyArchiveFile(dir, oldPw, newPw);
 
     DIR* d = opendir(dir.c_str());
     if (!d) {
@@ -939,427 +535,6 @@ static bool RekeyBackupTree(const std::string& dir, const std::string& oldPw, co
     return ok;
 }
 
-// TrueBackup container v1: wrapped master key in header + payload encrypted by master key.
-constexpr uint8_t kEncMagic[] = {'T', 'B', 'K', '1'};
-constexpr int kEncVersion = 1;
-constexpr size_t kEncSaltLen = 16;
-constexpr size_t kWrapIvLen = 12;
-constexpr size_t kPayloadIvLen = 12;
-constexpr size_t kMasterKeyLen = 32;
-constexpr int kEncPbkdf2Iters = 120000;
-constexpr size_t kGcmTagLen = 16;
-constexpr size_t kWrappedMasterLen = kMasterKeyLen + kGcmTagLen;
-
-static void WriteU32Be(FILE* out, uint32_t v) {
-    uint8_t b[4] = {
-        static_cast<uint8_t>((v >> 24) & 0xff),
-        static_cast<uint8_t>((v >> 16) & 0xff),
-        static_cast<uint8_t>((v >> 8) & 0xff),
-        static_cast<uint8_t>(v & 0xff),
-    };
-    fwrite(b, 1, sizeof(b), out);
-}
-
-static bool ReadU32Be(FILE* in, uint32_t* out) {
-    uint8_t b[4];
-    if (fread(b, 1, sizeof(b), in) != sizeof(b)) return false;
-    *out = (static_cast<uint32_t>(b[0]) << 24) | (static_cast<uint32_t>(b[1]) << 16) |
-           (static_cast<uint32_t>(b[2]) << 8) | static_cast<uint32_t>(b[3]);
-    return true;
-}
-
-static bool DeriveKey(const std::string& password, const uint8_t* salt, size_t saltLen, uint8_t outKey[32],
-                      uint32_t iterations = static_cast<uint32_t>(kEncPbkdf2Iters)) {
-    // Matches Java PBKDF2WithHmacSHA256 (BoringSSL uses PKCS5_PBKDF2_HMAC + EVP_sha256).
-    return PKCS5_PBKDF2_HMAC(reinterpret_cast<const char*>(password.data()), password.size(), salt, saltLen,
-                             iterations, EVP_sha256(), 32, outKey) == 1;
-}
-
-/**
- * Encrypts a regular file in place to TBK1:
- * [magic|version|iterations|salt|wrap_iv|payload_iv|wrapped_master|encrypted_payload|payload_tag]
- * If file already starts with TBK1, returns true.
- */
-static bool EncryptZipInPlace(const std::string& path, const std::string& password) {
-    if (path.empty() || path[0] != '/' || password.empty()) {
-        LOG(ERROR) << "EncryptZipInPlace: bad args";
-        return false;
-    }
-
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
-        LOG(ERROR) << "EncryptZipInPlace: not a regular file: " << path;
-        return false;
-    }
-
-    FILE* in = fopen(path.c_str(), "rb");
-    if (!in) {
-        PLOG(ERROR) << "EncryptZipInPlace: fopen failed: " << path;
-        return false;
-    }
-
-    uint8_t magic[4];
-    if (fread(magic, 1, 4, in) != 4) {
-        fclose(in);
-        return false;
-    }
-    if (memcmp(magic, kEncMagic, 4) == 0) {
-        fclose(in);
-        return true;
-    }
-    if (fseek(in, 0, SEEK_SET) != 0) {
-        fclose(in);
-        return false;
-    }
-
-    const std::string tmpPath = path + ".enc_tmp";
-    FILE* out = fopen(tmpPath.c_str(), "wb");
-    if (!out) {
-        fclose(in);
-        PLOG(ERROR) << "EncryptZipInPlace: fopen tmp failed: " << tmpPath;
-        return false;
-    }
-
-    uint8_t salt[kEncSaltLen];
-    uint8_t wrapIv[kWrapIvLen];
-    uint8_t payloadIv[kPayloadIvLen];
-    uint8_t masterKey[kMasterKeyLen];
-    if (RAND_bytes(salt, sizeof(salt)) != 1 || RAND_bytes(wrapIv, sizeof(wrapIv)) != 1 ||
-        RAND_bytes(payloadIv, sizeof(payloadIv)) != 1 || RAND_bytes(masterKey, sizeof(masterKey)) != 1) {
-        fclose(in);
-        fclose(out);
-        unlink(tmpPath.c_str());
-        return false;
-    }
-
-    uint8_t unlockKey[32];
-    if (!DeriveKey(password, salt, sizeof(salt), unlockKey)) {
-        OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
-        OPENSSL_cleanse(masterKey, sizeof(masterKey));
-        fclose(in);
-        fclose(out);
-        unlink(tmpPath.c_str());
-        return false;
-    }
-
-    uint8_t wrappedMaster[kWrappedMasterLen];
-    {
-        EVP_CIPHER_CTX* wrapCtx = EVP_CIPHER_CTX_new();
-        if (!wrapCtx) {
-            OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
-            OPENSSL_cleanse(masterKey, sizeof(masterKey));
-            fclose(in);
-            fclose(out);
-            unlink(tmpPath.c_str());
-            return false;
-        }
-        bool wrapOk = false;
-        do {
-            if (EVP_EncryptInit_ex(wrapCtx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
-            if (EVP_CIPHER_CTX_ctrl(wrapCtx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kWrapIvLen), nullptr) != 1) {
-                break;
-            }
-            if (EVP_EncryptInit_ex(wrapCtx, nullptr, nullptr, unlockKey, wrapIv) != 1) break;
-            int outLen = 0;
-            if (EVP_EncryptUpdate(wrapCtx, wrappedMaster, &outLen, masterKey, static_cast<int>(kMasterKeyLen)) != 1) {
-                break;
-            }
-            if (outLen != static_cast<int>(kMasterKeyLen)) break;
-            int finalLen = 0;
-            if (EVP_EncryptFinal_ex(wrapCtx, wrappedMaster + outLen, &finalLen) != 1) break;
-            if (EVP_CIPHER_CTX_ctrl(wrapCtx, EVP_CTRL_GCM_GET_TAG, static_cast<int>(kGcmTagLen),
-                                    wrappedMaster + kMasterKeyLen) != 1) {
-                break;
-            }
-            wrapOk = true;
-        } while (false);
-        EVP_CIPHER_CTX_free(wrapCtx);
-        if (!wrapOk) {
-            OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
-            OPENSSL_cleanse(masterKey, sizeof(masterKey));
-            fclose(in);
-            fclose(out);
-            unlink(tmpPath.c_str());
-            return false;
-        }
-    }
-
-    if (fwrite(kEncMagic, 1, 4, out) != 4 || fputc(kEncVersion, out) == EOF) {
-        OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
-        OPENSSL_cleanse(masterKey, sizeof(masterKey));
-        fclose(in);
-        fclose(out);
-        unlink(tmpPath.c_str());
-        return false;
-    }
-    WriteU32Be(out, static_cast<uint32_t>(kEncPbkdf2Iters));
-    if (fwrite(salt, 1, sizeof(salt), out) != sizeof(salt) || fwrite(wrapIv, 1, sizeof(wrapIv), out) != sizeof(wrapIv) ||
-        fwrite(payloadIv, 1, sizeof(payloadIv), out) != sizeof(payloadIv) ||
-        fwrite(wrappedMaster, 1, sizeof(wrappedMaster), out) != sizeof(wrappedMaster)) {
-        OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
-        OPENSSL_cleanse(masterKey, sizeof(masterKey));
-        OPENSSL_cleanse(wrappedMaster, sizeof(wrappedMaster));
-        fclose(in);
-        fclose(out);
-        unlink(tmpPath.c_str());
-        return false;
-    }
-    OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
-    OPENSSL_cleanse(wrappedMaster, sizeof(wrappedMaster));
-
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        OPENSSL_cleanse(masterKey, sizeof(masterKey));
-        fclose(in);
-        fclose(out);
-        unlink(tmpPath.c_str());
-        return false;
-    }
-
-    int ok = 0;
-    do {
-        if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kPayloadIvLen), nullptr) != 1) break;
-        if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, masterKey, payloadIv) != 1) break;
-
-        uint8_t buf[64 * 1024];
-        uint8_t outbuf[64 * 1024 + EVP_MAX_BLOCK_LENGTH];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-            int outlen = 0;
-            if (EVP_EncryptUpdate(ctx, outbuf, &outlen, buf, static_cast<int>(n)) != 1) {
-                ok = -1;
-                break;
-            }
-            if (outlen > 0 &&
-                static_cast<size_t>(fwrite(outbuf, 1, static_cast<size_t>(outlen), out)) != static_cast<size_t>(outlen)) {
-                ok = -1;
-                break;
-            }
-        }
-        if (ok != 0) break;
-        int finalLen = 0;
-        if (EVP_EncryptFinal_ex(ctx, outbuf, &finalLen) != 1) break;
-        if (finalLen > 0 && static_cast<size_t>(fwrite(outbuf, 1, static_cast<size_t>(finalLen), out)) !=
-            static_cast<size_t>(finalLen)) {
-            ok = -1;
-            break;
-        }
-        uint8_t tag[kGcmTagLen];
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, static_cast<int>(sizeof(tag)), tag) != 1) break;
-        if (fwrite(tag, 1, sizeof(tag), out) != sizeof(tag)) break;
-        ok = 1;
-    } while (false);
-
-    EVP_CIPHER_CTX_free(ctx);
-    OPENSSL_cleanse(masterKey, sizeof(masterKey));
-    fclose(in);
-    fclose(out);
-
-    if (ok != 1) {
-        unlink(tmpPath.c_str());
-        return false;
-    }
-
-    if (unlink(path.c_str()) != 0) {
-        unlink(tmpPath.c_str());
-        return false;
-    }
-    if (rename(tmpPath.c_str(), path.c_str()) != 0) {
-        PLOG(ERROR) << "EncryptZipInPlace: rename failed";
-        return false;
-    }
-    chmod(path.c_str(), st.st_mode & 07777);
-    return true;
-}
-
-static bool DecryptZipToFile(const std::string& encPath, const std::string& outPath, const std::string& password) {
-    if (encPath.empty() || encPath[0] != '/' || outPath.empty() || outPath[0] != '/' || password.empty()) {
-        LOG(ERROR) << "DecryptZipToFile: bad args";
-        return false;
-    }
-
-    FILE* in = fopen(encPath.c_str(), "rb");
-    if (!in) {
-        PLOG(ERROR) << "DecryptZipToFile: fopen failed: " << encPath;
-        return false;
-    }
-
-    uint8_t magic[4];
-    if (fread(magic, 1, 4, in) != 4) {
-        fclose(in);
-        return false;
-    }
-    if (memcmp(magic, kEncMagic, 4) != 0) {
-        fclose(in);
-        return false;
-    }
-    int ver = fgetc(in);
-    if (ver != kEncVersion) {
-        fclose(in);
-        return false;
-    }
-    uint32_t iterations = 0;
-    if (!ReadU32Be(in, &iterations) || iterations == 0) {
-        fclose(in);
-        return false;
-    }
-    uint8_t salt[kEncSaltLen];
-    uint8_t wrapIv[kWrapIvLen];
-    uint8_t payloadIv[kPayloadIvLen];
-    uint8_t wrappedMaster[kWrappedMasterLen];
-    if (fread(salt, 1, sizeof(salt), in) != sizeof(salt) || fread(wrapIv, 1, sizeof(wrapIv), in) != sizeof(wrapIv) ||
-        fread(payloadIv, 1, sizeof(payloadIv), in) != sizeof(payloadIv) ||
-        fread(wrappedMaster, 1, sizeof(wrappedMaster), in) != sizeof(wrappedMaster)) {
-        fclose(in);
-        return false;
-    }
-
-    long headerEnd = ftell(in);
-    if (headerEnd < 0) {
-        fclose(in);
-        return false;
-    }
-    if (fseek(in, 0, SEEK_END) != 0) {
-        fclose(in);
-        return false;
-    }
-    long fileSize = ftell(in);
-    if (fseek(in, headerEnd, SEEK_SET) != 0) {
-        fclose(in);
-        return false;
-    }
-
-    long ciphertextLen = fileSize - headerEnd - static_cast<long>(kGcmTagLen);
-    if (ciphertextLen < 0) {
-        fclose(in);
-        return false;
-    }
-
-    unlink(outPath.c_str());
-
-    FILE* out = fopen(outPath.c_str(), "wb");
-    if (!out) {
-        fclose(in);
-        PLOG(ERROR) << "DecryptZipToFile: fopen out failed: " << outPath;
-        return false;
-    }
-
-    uint8_t unlockKey[32];
-    if (!DeriveKey(password, salt, sizeof(salt), unlockKey, iterations)) {
-        OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
-        fclose(in);
-        fclose(out);
-        unlink(outPath.c_str());
-        return false;
-    }
-
-    uint8_t masterKey[kMasterKeyLen];
-    {
-        EVP_CIPHER_CTX* unwrapCtx = EVP_CIPHER_CTX_new();
-        if (!unwrapCtx) {
-            OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
-            fclose(in);
-            fclose(out);
-            unlink(outPath.c_str());
-            return false;
-        }
-        bool unwrapOk = false;
-        do {
-            if (EVP_DecryptInit_ex(unwrapCtx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
-            if (EVP_CIPHER_CTX_ctrl(unwrapCtx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kWrapIvLen), nullptr) != 1) {
-                break;
-            }
-            if (EVP_DecryptInit_ex(unwrapCtx, nullptr, nullptr, unlockKey, wrapIv) != 1) break;
-            int outLen = 0;
-            if (EVP_DecryptUpdate(unwrapCtx, masterKey, &outLen, wrappedMaster, static_cast<int>(kMasterKeyLen)) != 1) {
-                break;
-            }
-            if (outLen != static_cast<int>(kMasterKeyLen)) break;
-            if (EVP_CIPHER_CTX_ctrl(unwrapCtx, EVP_CTRL_GCM_SET_TAG, static_cast<int>(kGcmTagLen),
-                                    wrappedMaster + kMasterKeyLen) != 1) {
-                break;
-            }
-            int finalLen = 0;
-            if (EVP_DecryptFinal_ex(unwrapCtx, masterKey + outLen, &finalLen) != 1) break;
-            unwrapOk = true;
-        } while (false);
-        EVP_CIPHER_CTX_free(unwrapCtx);
-        OPENSSL_cleanse(unlockKey, sizeof(unlockKey));
-        OPENSSL_cleanse(wrappedMaster, sizeof(wrappedMaster));
-        if (!unwrapOk) {
-            OPENSSL_cleanse(masterKey, sizeof(masterKey));
-            fclose(in);
-            fclose(out);
-            unlink(outPath.c_str());
-            return false;
-        }
-    }
-
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
-        OPENSSL_cleanse(masterKey, sizeof(masterKey));
-        fclose(in);
-        fclose(out);
-        unlink(outPath.c_str());
-        return false;
-    }
-
-    bool fail = true;
-    do {
-        if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1) break;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(kPayloadIvLen), nullptr) != 1) break;
-        if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, masterKey, payloadIv) != 1) break;
-
-        uint8_t buf[64 * 1024];
-        uint8_t outbuf[64 * 1024 + EVP_MAX_BLOCK_LENGTH];
-        long remaining = ciphertextLen;
-        while (remaining > 0) {
-            const size_t chunk =
-                static_cast<size_t>(std::min<long>(remaining, static_cast<long>(sizeof(buf))));
-            if (fread(buf, 1, chunk, in) != chunk) goto decrypt_fail;
-            int outlen = 0;
-            if (EVP_DecryptUpdate(ctx, outbuf, &outlen, buf, static_cast<int>(chunk)) != 1) goto decrypt_fail;
-            if (outlen > 0 && fwrite(outbuf, 1, static_cast<size_t>(outlen), out) != static_cast<size_t>(outlen)) {
-                goto decrypt_fail;
-            }
-            remaining -= static_cast<long>(chunk);
-        }
-
-        uint8_t tag[kGcmTagLen];
-        if (fread(tag, 1, sizeof(tag), in) != sizeof(tag)) goto decrypt_fail;
-        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, static_cast<int>(sizeof(tag)), tag) != 1) {
-            goto decrypt_fail;
-        }
-
-        uint8_t finalBuf[256];
-        int finalLen = 0;
-        if (EVP_DecryptFinal_ex(ctx, finalBuf, &finalLen) != 1) goto decrypt_fail;
-        if (finalLen > 0 && fwrite(finalBuf, 1, static_cast<size_t>(finalLen), out) != static_cast<size_t>(finalLen)) {
-            goto decrypt_fail;
-        }
-        fail = false;
-    } while (false);
-
-decrypt_fail:
-    EVP_CIPHER_CTX_free(ctx);
-    OPENSSL_cleanse(masterKey, sizeof(masterKey));
-    fclose(in);
-    fclose(out);
-    if (fail) {
-        unlink(outPath.c_str());
-        return false;
-    }
-    {
-        const std::string prefix = std::string(kTrueBackupTmpDir) + "/";
-        if (outPath.size() > prefix.size() && outPath.compare(0, prefix.size(), prefix) == 0) {
-            if (chmod(outPath.c_str(), 0644) != 0) {
-                PLOG(WARNING) << "chmod decrypted tmp: " << outPath;
-            }
-        }
-    }
-    return true;
-}
 
 static bool RemoveTree(const std::string& path) {
     if (path.empty() || path[0] != '/') {
@@ -1429,17 +604,17 @@ class TrueBackupDaemonService : public android::BBinder {
         }
 
         switch (code) {
-            case ZIP_DIR: {
+            case TAR_DIR: {
                 std::string src = std::string(android::String8(data.readString16()).c_str());
                 std::string out = std::string(android::String8(data.readString16()).c_str());
-                bool ok = ZipDir(src, out);
+                bool ok = TarDir(src, out);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }
-            case UNZIP_TO_DIR: {
-                std::string zip = std::string(android::String8(data.readString16()).c_str());
+            case UNTAR_TO_DIR: {
+                std::string archive = std::string(android::String8(data.readString16()).c_str());
                 std::string out = std::string(android::String8(data.readString16()).c_str());
-                bool ok = UnzipToDir(zip, out);
+                bool ok = UntarToDir(archive, out);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }
@@ -1449,15 +624,15 @@ class TrueBackupDaemonService : public android::BBinder {
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }
-            case ZIP_SINGLE_FILE: {
+            case TAR_SINGLE_FILE: {
                 std::string src = std::string(android::String8(data.readString16()).c_str());
                 std::string out = std::string(android::String8(data.readString16()).c_str());
                 std::string entry = std::string(android::String8(data.readString16()).c_str());
-                bool ok = ZipSingleFileToZip(src, out, entry);
+                bool ok = TarSingleFile(src, out, entry);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }
-            case ZIP_MULTI_FILE: {
+            case TAR_MULTI_FILE: {
                 std::string out = std::string(android::String8(data.readString16()).c_str());
                 int32_t count = data.readInt32();
                 if (count <= 0 || count > 128) {
@@ -1474,7 +649,7 @@ class TrueBackupDaemonService : public android::BBinder {
                     files.emplace_back(std::move(src), std::move(entry));
                 }
 
-                bool ok = ZipMultiFileToZip(files, out);
+                bool ok = TarMultiFile(files, out);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }
@@ -1586,18 +761,18 @@ class TrueBackupDaemonService : public android::BBinder {
                 reply->writeString16(android::String16(content.c_str()));
                 return android::NO_ERROR;
             }
-            case ENCRYPT_ZIP_IN_PLACE: {
+            case ENCRYPT_ARCHIVE_IN_PLACE: {
                 std::string p = std::string(android::String8(data.readString16()).c_str());
                 std::string pw = std::string(android::String8(data.readString16()).c_str());
-                bool ok = EncryptZipInPlace(p, pw);
+                bool ok = EncryptArchiveInPlace(p, pw);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }
-            case DECRYPT_ZIP_TO_FILE: {
+            case DECRYPT_ARCHIVE_TO_FILE: {
                 std::string enc = std::string(android::String8(data.readString16()).c_str());
                 std::string out = std::string(android::String8(data.readString16()).c_str());
                 std::string pw = std::string(android::String8(data.readString16()).c_str());
-                bool ok = DecryptZipToFile(enc, out, pw);
+                bool ok = DecryptArchiveToFile(enc, out, pw);
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }

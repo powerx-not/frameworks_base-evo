@@ -50,8 +50,7 @@ import java.util.Base64;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
+import android.os.FileUtils;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -110,17 +109,17 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
     private static final String TRUEBACKUPD_SERVICE = "truebackupd";
     private static final int TRUEBACKUPD_TOKEN = 0x5452424b; // 'TRBK'
-    private static final int TRUEBACKUPD_ZIP_DIR = IBinder.FIRST_CALL_TRANSACTION;
-    private static final int TRUEBACKUPD_UNZIP_TO_DIR = IBinder.FIRST_CALL_TRANSACTION + 1;
+    private static final int TRUEBACKUPD_TAR_DIR = IBinder.FIRST_CALL_TRANSACTION;
+    private static final int TRUEBACKUPD_UNTAR_TO_DIR = IBinder.FIRST_CALL_TRANSACTION + 1;
     private static final int TRUEBACKUPD_MKDIRS = IBinder.FIRST_CALL_TRANSACTION + 2;
-    private static final int TRUEBACKUPD_ZIP_MULTI_FILE = IBinder.FIRST_CALL_TRANSACTION + 4;
+    private static final int TRUEBACKUPD_TAR_MULTI_FILE = IBinder.FIRST_CALL_TRANSACTION + 4;
     private static final int TRUEBACKUPD_WRITE_FILE = IBinder.FIRST_CALL_TRANSACTION + 5;
     private static final int TRUEBACKUPD_CHOWN_AND_CHCON = IBinder.FIRST_CALL_TRANSACTION + 13;
     private static final int TRUEBACKUPD_DELETE_TREE = IBinder.FIRST_CALL_TRANSACTION + 7;
     private static final int TRUEBACKUPD_SET_PASSWORD = IBinder.FIRST_CALL_TRANSACTION + 8;
     private static final int TRUEBACKUPD_GET_PASSWORD = IBinder.FIRST_CALL_TRANSACTION + 9;
-    private static final int TRUEBACKUPD_ENCRYPT_ZIP_IN_PLACE = IBinder.FIRST_CALL_TRANSACTION + 10;
-    private static final int TRUEBACKUPD_DECRYPT_ZIP_TO_FILE = IBinder.FIRST_CALL_TRANSACTION + 11;
+    private static final int TRUEBACKUPD_ENCRYPT_ARCHIVE_IN_PLACE = IBinder.FIRST_CALL_TRANSACTION + 10;
+    private static final int TRUEBACKUPD_DECRYPT_ARCHIVE_TO_FILE = IBinder.FIRST_CALL_TRANSACTION + 11;
     private static final int TRUEBACKUPD_CHANGE_PASSWORD = IBinder.FIRST_CALL_TRANSACTION + 12;
     private static final int TRUEBACKUPD_REKEY_BACKUP_TREE = IBinder.FIRST_CALL_TRANSACTION + 14;
     private static final int TRUEBACKUPD_APPEND_KNOWN_BACKUP_PATH = IBinder.FIRST_CALL_TRANSACTION + 15;
@@ -139,12 +138,12 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     private static final String DIR_EXT_DATA = "ext_data";
     private static final String DIR_ADDL_DATA = "addl_data";
 
-    private static final String ZIP_APK = "apk.zip";
-    private static final String ZIP_USER = "user.zip";
-    private static final String ZIP_USER_DE = "user_de.zip";
-    private static final String ZIP_DATA = "data.zip";
-    private static final String ZIP_OBB = "obb.zip";
-    private static final String ZIP_MEDIA = "media.zip";
+    private static final String ARCH_APK = "apk.tbak";
+    private static final String ARCH_USER = "user.tbak";
+    private static final String ARCH_USER_DE = "user_de.tbak";
+    private static final String ARCH_DATA = "data.tbak";
+    private static final String ARCH_OBB = "obb.tbak";
+    private static final String ARCH_MEDIA = "media.tbak";
 
 
     private static final String SETTINGS_FILE_SSAID = "settings_ssaid.xml";
@@ -181,8 +180,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         return "/data/media/" + userId + "/Android/media";
     }
 
-    /** TBK1 magic (format implemented in truebackupd with wrapped master key header). */
-    private static final byte[] ENC_MAGIC = new byte[] { 'T', 'B', 'K', '1' };
+    /** TBK2 magic: [TBK2][salt 8][iv 16][AES-256-CBC encrypted ustar tar] (truebackupd). */
+    private static final byte[] ENC_MAGIC = new byte[] { 'T', 'B', 'K', '2' };
     private static final String REG_PW_KEYSTORE = "AndroidKeyStore";
     private static final String REG_PW_KEY_ALIAS = "truebackup_registration_password_v1";
     private static final String REG_PW_BLOB_PREFIX = "tbpw1:";
@@ -487,36 +486,36 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             BackupParts parts = new BackupParts();
 
             // APK
-            File apkZip = new File(new File(pkgDir, DIR_APK), ZIP_APK);
-            parts.apk = zipApk(packageName, userId, apkZip);
-            maybeEncryptInPlace(apkZip);
+            File apkArch = new File(new File(pkgDir, DIR_APK), ARCH_APK);
+            parts.apk = tarApk(packageName, userId, apkArch);
+            maybeEncryptInPlace(apkArch);
             setActiveProgressStep(++done, totalSteps);
 
             // Internal data
-            File ceZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER);
-            parts.userCe = zipDirIfExists(new File(ceBase(userId), packageName), ceZip);
-            maybeEncryptInPlace(ceZip);
+            File ceArch = new File(new File(pkgDir, DIR_INT_DATA), ARCH_USER);
+            parts.userCe = tarDirIfExists(new File(ceBase(userId), packageName), ceArch);
+            maybeEncryptInPlace(ceArch);
             setActiveProgressStep(++done, totalSteps);
 
-            File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
-            parts.userDe = zipDirIfExists(new File(deBase(userId), packageName), deZip);
-            maybeEncryptInPlace(deZip);
+            File deArch = new File(new File(pkgDir, DIR_INT_DATA), ARCH_USER_DE);
+            parts.userDe = tarDirIfExists(new File(deBase(userId), packageName), deArch);
+            maybeEncryptInPlace(deArch);
             setActiveProgressStep(++done, totalSteps);
 
             // External data
-            File extZip = new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA);
-            parts.extData = zipDirIfExists(new File(extDataBase(userId), packageName), extZip);
-            maybeEncryptInPlace(extZip);
+            File extArch = new File(new File(pkgDir, DIR_EXT_DATA), ARCH_DATA);
+            parts.extData = tarDirIfExists(new File(extDataBase(userId), packageName), extArch);
+            maybeEncryptInPlace(extArch);
             setActiveProgressStep(++done, totalSteps);
 
             // Additional
-            File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
-            parts.obb = zipDirIfExists(new File(obbBase(userId), packageName), obbZip);
-            maybeEncryptInPlace(obbZip);
+            File obbArch = new File(new File(pkgDir, DIR_ADDL_DATA), ARCH_OBB);
+            parts.obb = tarDirIfExists(new File(obbBase(userId), packageName), obbArch);
+            maybeEncryptInPlace(obbArch);
 
-            File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
-            parts.media = zipDirIfExists(new File(mediaBase(userId), packageName), mediaZip);
-            maybeEncryptInPlace(mediaZip);
+            File mediaArch = new File(new File(pkgDir, DIR_ADDL_DATA), ARCH_MEDIA);
+            parts.media = tarDirIfExists(new File(mediaBase(userId), packageName), mediaArch);
+            maybeEncryptInPlace(mediaArch);
             setActiveProgressStep(++done, totalSteps);
 
             writeConfig(new File(pkgDir, FILE_CONFIG), packageName, userId, parts);
@@ -920,7 +919,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
     }
 
     /**
-     * Scratch space under {@code /data/system/truebackup/tmp} (not next to backup zips on removable
+     * Scratch space under {@code /data/system/truebackup/tmp} (not next to backup archives on removable
      * storage). Created by truebackupd with DAC that allows system_server to use it.
      */
     private File getTrueBackupTempDir() throws IOException {
@@ -939,6 +938,38 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
     private File createTrueBackupWorkFile(String prefix, String suffix) throws IOException {
         return File.createTempFile(prefix, suffix, getTrueBackupTempDir());
+    }
+
+    private File createTrueBackupWorkDir(String prefix) throws IOException {
+        File dir = File.createTempFile(prefix, "", getTrueBackupTempDir());
+        //noinspection ResultOfMethodCallIgnored
+        dir.delete();
+        if (!dir.mkdir() && !dir.isDirectory()) {
+            throw new IOException("Could not create work dir: " + dir);
+        }
+        // Allow truebackupd (root) to write extracted tar entries; fixupRestoredTree reassigns to system.
+        if (!dir.setReadable(true, false) || !dir.setWritable(true, false) || !dir.setExecutable(true, false)) {
+            Slog.w(TAG, "Could not chmod work dir for daemon extract: " + dir);
+        }
+        return dir;
+    }
+
+    private static List<File> collectApkFiles(File root) {
+        List<File> out = new ArrayList<>();
+        collectApkFilesRecursive(root, out);
+        return out;
+    }
+
+    private static void collectApkFilesRecursive(File dir, List<File> out) {
+        File[] children = dir.listFiles();
+        if (children == null) return;
+        for (File f : children) {
+            if (f.isDirectory()) {
+                collectApkFilesRecursive(f, out);
+            } else if (f.isFile() && f.getName().endsWith(".apk")) {
+                out.add(f);
+            }
+        }
     }
 
     private synchronized String readRegistrationPasswordStored() {
@@ -1165,13 +1196,13 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         return out.toByteArray();
     }
 
-    private void maybeEncryptInPlace(File zipFile) {
-        if (zipFile == null || !zipFile.exists() || !zipFile.isFile()) return;
-        if (isEncryptedFile(zipFile)) return;
+    private void maybeEncryptInPlace(File archiveFile) {
+        if (archiveFile == null || !archiveFile.exists() || !archiveFile.isFile()) return;
+        if (isEncryptedFile(archiveFile)) return;
         String pw = readRegistrationPassword();
         if (pw == null) return;
-        if (!daemonEncryptZipInPlace(zipFile, pw)) {
-            Slog.w(TAG, "daemonEncryptZipInPlace failed for " + zipFile);
+        if (!daemonEncryptArchiveInPlace(archiveFile, pw)) {
+            Slog.w(TAG, "daemonEncryptArchiveInPlace failed for " + archiveFile);
         }
     }
 
@@ -1310,32 +1341,21 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             return;
         }
 
-        File apkZip = new File(new File(pkgDir, DIR_APK), ZIP_APK);
-        if (!apkZip.exists()) {
-            throw new IOException("App not installed and apk.zip missing: " + apkZip);
+        File apkArch = new File(new File(pkgDir, DIR_APK), ARCH_APK);
+        if (!apkArch.exists()) {
+            throw new IOException("App not installed and apk.tbak missing: " + apkArch);
         }
 
-        // Encrypted backups store TBK1-wrapped bytes; decrypt via truebackupd before parsing as ZIP.
-        // Decrypted copy lives under /data/system/truebackup/tmp (system_server has no app cache dir).
-        File zipToRead = apkZip;
-        File tmpDecrypted = null;
-        if (isEncryptedFile(apkZip)) {
-            tmpDecrypted = createTrueBackupWorkFile("truebackup_apk_", ".zip");
-            String pw = readRegistrationPassword();
-            if (pw == null) {
-                //noinspection ResultOfMethodCallIgnored
-                tmpDecrypted.delete();
-                throw new IOException("No registration password for apk.zip");
-            }
-            if (!daemonDecryptZipToFile(apkZip, tmpDecrypted, pw)) {
-                //noinspection ResultOfMethodCallIgnored
-                tmpDecrypted.delete();
-                throw new IOException("Could not decrypt apk.zip: " + apkZip);
-            }
-            zipToRead = tmpDecrypted;
-        }
-
+        File apkExtractDir = createTrueBackupWorkDir("truebackup_apk_");
         try {
+            untarToDirMaybeDaemon(apkArch, apkExtractDir);
+            // Extracted entries are owned by truebackupd (root); hand off to system_server for install.
+            fixupRestoredTree(apkExtractDir, Process.SYSTEM_UID, Process.SYSTEM_UID);
+            List<File> apkFiles = collectApkFiles(apkExtractDir);
+            if (apkFiles.isEmpty()) {
+                throw new IOException("No APK entries found inside: " + apkArch);
+            }
+
             // Install via PackageInstaller session for the target profile (clone / work user).
             Context userCtx = getContextForUser(userId);
             PackageManager pm = userCtx.getPackageManager();
@@ -1348,30 +1368,17 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             PackageInstaller.Session session = installer.openSession(sessionId);
             try {
                 byte[] buffer = new byte[128 * 1024];
-                boolean wroteAny = false;
-                try (ZipInputStream zis = new ZipInputStream(new FileInputStream(zipToRead))) {
-                    ZipEntry entry;
-                    while ((entry = zis.getNextEntry()) != null) {
-                        if (entry.isDirectory()) continue;
-                        String name = entry.getName();
-                        if (name == null || !name.endsWith(".apk")) continue;
-
-                        String apkName = new File(name).getName();
-                        if (apkName.isEmpty()) continue;
-
-                        try (java.io.OutputStream out = session.openWrite(apkName, 0, entry.getSize())) {
-                            int n;
-                            while ((n = zis.read(buffer)) > 0) {
-                                out.write(buffer, 0, n);
-                            }
-                            session.fsync(out);
+                for (File apkFile : apkFiles) {
+                    String apkName = apkFile.getName();
+                    if (apkName.isEmpty()) continue;
+                    try (java.io.FileInputStream in = new java.io.FileInputStream(apkFile);
+                            java.io.OutputStream out = session.openWrite(apkName, 0, apkFile.length())) {
+                        int n;
+                        while ((n = in.read(buffer)) > 0) {
+                            out.write(buffer, 0, n);
                         }
-                        wroteAny = true;
+                        session.fsync(out);
                     }
-                }
-
-                if (!wroteAny) {
-                    throw new IOException("No APK entries found inside: " + apkZip);
                 }
 
                 LocalIntentReceiver receiver = new LocalIntentReceiver();
@@ -1394,9 +1401,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             Thread.currentThread().interrupt();
             throw new IOException("Interrupted waiting for install result for: " + packageName, e);
         } finally {
-            if (tmpDecrypted != null) {
-                //noinspection ResultOfMethodCallIgnored
-                tmpDecrypted.delete();
+            if (!FileUtils.deleteContentsAndDir(apkExtractDir)) {
+                Slog.w(TAG, "cleanup apk extract dir failed: " + apkExtractDir);
             }
         }
 
@@ -1608,7 +1614,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private boolean zipMultiFileWithDaemon(File[] sourceFiles, String[] entryNames, File outZip) {
+    private boolean tarMultiFileWithDaemon(File[] sourceFiles, String[] entryNames, File outArchive) {
         if (sourceFiles == null || entryNames == null) return false;
         if (sourceFiles.length != entryNames.length) return false;
 
@@ -1619,14 +1625,14 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         android.os.Parcel reply = android.os.Parcel.obtain();
         try {
             data.writeInt(TRUEBACKUPD_TOKEN);
-            data.writeString16(outZip.getAbsolutePath());
+            data.writeString16(outArchive.getAbsolutePath());
             data.writeInt(sourceFiles.length);
             for (int i = 0; i < sourceFiles.length; i++) {
                 data.writeString16(sourceFiles[i].getAbsolutePath());
                 data.writeString16(entryNames[i]);
             }
 
-            boolean ok = daemon.transact(TRUEBACKUPD_ZIP_MULTI_FILE, data, reply, 0);
+            boolean ok = daemon.transact(TRUEBACKUPD_TAR_MULTI_FILE, data, reply, 0);
             if (!ok) return false;
             int rc = reply.readInt();
             return rc == 0;
@@ -1638,7 +1644,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private boolean zipApk(String packageName, int userId, File outZip) throws IOException {
+    private boolean tarApk(String packageName, int userId, File outArchive) throws IOException {
         PackageManager pm = mContext.getPackageManager();
         ApplicationInfo ai;
         try {
@@ -1672,64 +1678,64 @@ public class TrueBackupService extends ITrueBackupService.Stub {
             entries[1 + i] = f.getName();
         }
 
-        return zipMultiFileWithDaemon(files, entries, outZip);
+        return tarMultiFileWithDaemon(files, entries, outArchive);
     }
 
-    private boolean zipDirIfExists(File sourceDir, File outZip) throws IOException {
+    private boolean tarDirIfExists(File sourceDir, File outArchive) throws IOException {
         if (!sourceDir.exists()) {
             return false;
         }
 
-        return zipDirectoryWithDaemon(sourceDir, outZip);
+        return tarDirectoryWithDaemon(sourceDir, outArchive);
     }
 
     private void restoreFromPackageDir(String packageName, File pkgDir, int userId) throws IOException {
         final int totalSteps = 7;
         int done = 0;
-        // If the app is not installed, install it first from apk.zip so /data_mirror targets exist.
+        // If the app is not installed, install it first from apk.tbak so /data_mirror targets exist.
         installApksFromBackupIfNeeded(packageName, pkgDir, userId);
         setActiveProgressStep(++done, totalSteps);
 
         final int appUid = getApplicationUidOrThrow(packageName, userId);
 
-        File ceZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER);
-        if (ceZip.exists()) {
+        File ceArch = new File(new File(pkgDir, DIR_INT_DATA), ARCH_USER);
+        if (ceArch.exists()) {
             File target = new File(ceBase(userId), packageName);
-            unzipToDirMaybeDaemon(ceZip, target);
+            untarToDirMaybeDaemon(ceArch, target);
             fixupRestoredTree(target, appUid, appUid, -1);
         }
         setActiveProgressStep(++done, totalSteps);
 
-        File deZip = new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE);
-        if (deZip.exists()) {
+        File deArch = new File(new File(pkgDir, DIR_INT_DATA), ARCH_USER_DE);
+        if (deArch.exists()) {
             File target = new File(deBase(userId), packageName);
-            unzipToDirMaybeDaemon(deZip, target);
+            untarToDirMaybeDaemon(deArch, target);
             fixupRestoredTree(target, appUid, appUid, -1);
         }
         setActiveProgressStep(++done, totalSteps);
 
-        File extZip = new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA);
-        if (extZip.exists()) {
+        File extArch = new File(new File(pkgDir, DIR_EXT_DATA), ARCH_DATA);
+        if (extArch.exists()) {
             File target = new File(extDataBase(userId), packageName);
-            unzipToDirMaybeDaemon(extZip, target);
+            untarToDirMaybeDaemon(extArch, target);
             int extGid = statDirGidOrUid(extDataGidRef(userId), appUid);
             fixupRestoredTree(target, appUid, extGid, MODE_ANDROID_DATA_DIR);
         }
         setActiveProgressStep(++done, totalSteps);
 
-        File obbZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB);
-        if (obbZip.exists()) {
+        File obbArch = new File(new File(pkgDir, DIR_ADDL_DATA), ARCH_OBB);
+        if (obbArch.exists()) {
             File target = new File(obbBase(userId), packageName);
-            unzipToDirMaybeDaemon(obbZip, target);
+            untarToDirMaybeDaemon(obbArch, target);
             int obbGid = statDirGidOrUid(obbGidRef(userId), appUid);
             fixupRestoredTree(target, appUid, obbGid, MODE_ANDROID_SHARED_PKG_DIR);
         }
         setActiveProgressStep(++done, totalSteps);
 
-        File mediaZip = new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA);
-        if (mediaZip.exists()) {
+        File mediaArch = new File(new File(pkgDir, DIR_ADDL_DATA), ARCH_MEDIA);
+        if (mediaArch.exists()) {
             File target = new File(mediaBase(userId), packageName);
-            unzipToDirMaybeDaemon(mediaZip, target);
+            untarToDirMaybeDaemon(mediaArch, target);
             int mediaGid = statDirGidOrUid(mediaGidRef(userId), appUid);
             fixupRestoredTree(target, appUid, mediaGid, MODE_ANDROID_SHARED_PKG_DIR);
         }
@@ -1812,7 +1818,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private boolean zipDirectoryWithDaemon(File sourceDir, File outZip) {
+    private boolean tarDirectoryWithDaemon(File sourceDir, File outArchive) {
         IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
         if (daemon == null) return false;
 
@@ -1821,8 +1827,8 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         try {
             data.writeInt(TRUEBACKUPD_TOKEN);
             data.writeString16(sourceDir.getAbsolutePath());
-            data.writeString16(outZip.getAbsolutePath());
-            boolean ok = daemon.transact(TRUEBACKUPD_ZIP_DIR, data, reply, 0);
+            data.writeString16(outArchive.getAbsolutePath());
+            boolean ok = daemon.transact(TRUEBACKUPD_TAR_DIR, data, reply, 0);
             if (!ok) return false;
             int rc = reply.readInt();
             return rc == 0;
@@ -1834,20 +1840,20 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private boolean daemonEncryptZipInPlace(File zipFile, String password) {
+    private boolean daemonEncryptArchiveInPlace(File archiveFile, String password) {
         IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
         if (daemon == null || password == null || password.isEmpty()) return false;
         Parcel data = Parcel.obtain();
         Parcel reply = Parcel.obtain();
         try {
             data.writeInt(TRUEBACKUPD_TOKEN);
-            data.writeString16(zipFile.getAbsolutePath());
+            data.writeString16(archiveFile.getAbsolutePath());
             data.writeString16(password);
-            boolean ok = daemon.transact(TRUEBACKUPD_ENCRYPT_ZIP_IN_PLACE, data, reply, 0);
+            boolean ok = daemon.transact(TRUEBACKUPD_ENCRYPT_ARCHIVE_IN_PLACE, data, reply, 0);
             if (!ok) return false;
             return reply.readInt() == 0;
         } catch (RemoteException e) {
-            Slog.w(TAG, "daemonEncryptZipInPlace", e);
+            Slog.w(TAG, "daemonEncryptArchiveInPlace", e);
             return false;
         } finally {
             reply.recycle();
@@ -1855,7 +1861,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private boolean daemonDecryptZipToFile(File encFile, File outPlain, String password) {
+    private boolean daemonDecryptArchiveToFile(File encFile, File outPlainTar, String password) {
         IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
         if (daemon == null || password == null || password.isEmpty()) return false;
         Parcel data = Parcel.obtain();
@@ -1863,13 +1869,13 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         try {
             data.writeInt(TRUEBACKUPD_TOKEN);
             data.writeString16(encFile.getAbsolutePath());
-            data.writeString16(outPlain.getAbsolutePath());
+            data.writeString16(outPlainTar.getAbsolutePath());
             data.writeString16(password);
-            boolean ok = daemon.transact(TRUEBACKUPD_DECRYPT_ZIP_TO_FILE, data, reply, 0);
+            boolean ok = daemon.transact(TRUEBACKUPD_DECRYPT_ARCHIVE_TO_FILE, data, reply, 0);
             if (!ok) return false;
             return reply.readInt() == 0;
         } catch (RemoteException e) {
-            Slog.w(TAG, "daemonDecryptZipToFile", e);
+            Slog.w(TAG, "daemonDecryptArchiveToFile", e);
             return false;
         } finally {
             reply.recycle();
@@ -1877,23 +1883,23 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private void unzipToDirMaybeDaemon(File zipFile, File targetDir) throws IOException {
-        File toUnzip = zipFile;
+    private void untarToDirMaybeDaemon(File archiveFile, File targetDir) throws IOException {
+        File toUntar = archiveFile;
         File tmp = null;
         try {
-            if (isEncryptedFile(zipFile)) {
-                tmp = createTrueBackupWorkFile("tb_unzip_", ".zip");
+            if (isEncryptedFile(archiveFile)) {
+                tmp = createTrueBackupWorkFile("tb_untar_", ".tar");
                 String pw = readRegistrationPassword();
                 if (pw == null) {
-                    throw new IOException("No registration password for " + zipFile);
+                    throw new IOException("No registration password for " + archiveFile);
                 }
-                if (!daemonDecryptZipToFile(zipFile, tmp, pw)) {
-                    throw new IOException("Could not decrypt backup zip: " + zipFile);
+                if (!daemonDecryptArchiveToFile(archiveFile, tmp, pw)) {
+                    throw new IOException("Could not decrypt backup archive: " + archiveFile);
                 }
-                toUnzip = tmp;
+                toUntar = tmp;
             }
-            if (!unzipToDirWithDaemon(toUnzip, targetDir)) {
-                throw new IOException("Unzip failed via daemon for " + toUnzip);
+            if (!untarToDirWithDaemon(toUntar, targetDir)) {
+                throw new IOException("Untar failed via daemon for " + toUntar);
             }
         } finally {
             if (tmp != null) {
@@ -1903,7 +1909,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         }
     }
 
-    private boolean unzipToDirWithDaemon(File zipFile, File targetDir) {
+    private boolean untarToDirWithDaemon(File archiveFile, File targetDir) {
         IBinder daemon = ServiceManager.getService(TRUEBACKUPD_SERVICE);
         if (daemon == null) return false;
 
@@ -1911,9 +1917,9 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         android.os.Parcel reply = android.os.Parcel.obtain();
         try {
             data.writeInt(TRUEBACKUPD_TOKEN);
-            data.writeString16(zipFile.getAbsolutePath());
+            data.writeString16(archiveFile.getAbsolutePath());
             data.writeString16(targetDir.getAbsolutePath());
-            boolean ok = daemon.transact(TRUEBACKUPD_UNZIP_TO_DIR, data, reply, 0);
+            boolean ok = daemon.transact(TRUEBACKUPD_UNTAR_TO_DIR, data, reply, 0);
             if (!ok) return false;
             int rc = reply.readInt();
             return rc == 0;
@@ -1973,7 +1979,7 @@ public class TrueBackupService extends ITrueBackupService.Stub {
         JSONObject backupConfig = new JSONObject();
         backupConfig.put("packageName", packageName);
         backupConfig.put("userId", userId);
-        backupConfig.put("compression", "zip");
+        backupConfig.put("compression", "tar+aes");
         backupConfig.put("preserveId", now);
         File pkgDir = outConfig.getParentFile();
         backupConfig.put("storagePath", pkgDir != null ? pkgDir.getAbsolutePath() : null);
@@ -1991,12 +1997,12 @@ public class TrueBackupService extends ITrueBackupService.Stub {
 
         JSONObject dataStats = new JSONObject();
         if (pkgDir != null) {
-            dataStats.put("apkBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_APK), ZIP_APK)));
-            dataStats.put("userBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER)));
-            dataStats.put("userDeBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_INT_DATA), ZIP_USER_DE)));
-            dataStats.put("dataBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_EXT_DATA), ZIP_DATA)));
-            dataStats.put("obbBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_OBB)));
-            dataStats.put("mediaBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_ADDL_DATA), ZIP_MEDIA)));
+            dataStats.put("apkBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_APK), ARCH_APK)));
+            dataStats.put("userBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_INT_DATA), ARCH_USER)));
+            dataStats.put("userDeBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_INT_DATA), ARCH_USER_DE)));
+            dataStats.put("dataBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_EXT_DATA), ARCH_DATA)));
+            dataStats.put("obbBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_ADDL_DATA), ARCH_OBB)));
+            dataStats.put("mediaBytes", fileBytesIfExists(new File(new File(pkgDir, DIR_ADDL_DATA), ARCH_MEDIA)));
         }
         obj.put("dataStats", dataStats);
 

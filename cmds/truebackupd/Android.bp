@@ -6,6 +6,7 @@ cc_binary {
     name: "truebackupd",
     srcs: [
         "truebackupd.cpp",
+        "truebackup_archive.cpp",
     ],
     shared_libs: [
         "libbase",
@@ -14,7 +15,6 @@ cc_binary {
         "liblog",
         "libselinux",
         "libutils",
-        "libziparchive",
     ],
     cflags: [
         "-Wall",
