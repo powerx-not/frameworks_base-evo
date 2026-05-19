@@ -193,9 +193,9 @@ public class AppLockService extends IAppLockManager.Stub implements IAppLockServ
         public void onChange(boolean selfChange) {
             ContentResolver resolver = mContext.getContentResolver();
             mLockBehavior = Settings.Secure.getIntForUser(resolver, SETTING_LOCK_BEHAVIOR,
-                    LOCK_BEHAVIOR_ON_LEAVE, UserHandle.USER_ALL);
+                    LOCK_BEHAVIOR_ON_LEAVE, UserHandle.USER_SYSTEM);
             mLockTimeout = Settings.Secure.getIntForUser(resolver, SETTING_LOCK_TIMEOUT,
-                    AppLockManager.DEFAULT_LOCK_TIMEOUT, UserHandle.USER_ALL);
+                    AppLockManager.DEFAULT_LOCK_TIMEOUT, UserHandle.USER_SYSTEM);
         }
     }
 

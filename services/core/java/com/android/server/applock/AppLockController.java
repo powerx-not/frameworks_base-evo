@@ -89,7 +89,7 @@ public class AppLockController {
 
     private void loadEnabled() {
         mEnabled = Settings.Secure.getIntForUser(mContentResolver, AppLockManager.SETTING_ENABLED,
-                0, UserHandle.USER_ALL) != 0;
+                0, UserHandle.USER_SYSTEM) != 0;
         Slog.d(TAG, "App lock enabled=" + mEnabled);
     }
 
@@ -123,7 +123,7 @@ public class AppLockController {
 
     public void setEnabled(boolean enabled) {
         Settings.Secure.putIntForUser(mContentResolver, AppLockManager.SETTING_ENABLED,
-                enabled ? 1 : 0, UserHandle.USER_ALL);
+                enabled ? 1 : 0, UserHandle.USER_SYSTEM);
         mEnabled = enabled;
     }
 
