@@ -16,7 +16,6 @@
 
 package com.android.server.wm;
 
-import com.android.server.applock.AppLockService;
 
 import static android.Manifest.permission.ACTIVITY_EMBEDDING;
 import static android.Manifest.permission.CAMERA;

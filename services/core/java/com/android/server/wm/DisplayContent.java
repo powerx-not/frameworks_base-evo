@@ -16,7 +16,6 @@
 
 package com.android.server.wm;
 
-import com.android.server.applock.AppLockService;
 
 import static android.app.ActivityTaskManager.INVALID_TASK_ID;
 import static android.app.WindowConfiguration.ACTIVITY_TYPE_DREAM;

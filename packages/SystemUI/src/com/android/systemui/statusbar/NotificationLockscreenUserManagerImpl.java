@@ -747,7 +747,6 @@ public class NotificationLockscreenUserManagerImpl implements
         boolean appLockLocked = extras.getBoolean(
                 AppLockManager.EXTRA_NOTIFICATION_APP_LOCKED, false);
         String pkg = ent.getSbn().getPackageName();
-        int userId = ent.getSbn().getUserId();
         if ((appLockLocked && mAppLockHelper.needsAuth(pkg, userId))
                 || (sandboxLocked && mAxAppLockerHelper.needsAuth(pkg, userId))) {
             return REDACTION_TYPE_PUBLIC;

@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  */
-package com.android.server.applock;
+package com.android.server.wm;
 
 import static android.app.AppLockManager.AppLockState.LOCKED;
 import static android.app.AppLockManager.AppLockState.NONE;
@@ -40,12 +40,7 @@ import android.util.Slog;
 import com.android.internal.app.IAppLockManager;
 import com.android.internal.app.IAppLockStateListener;
 import com.android.internal.app.IAppSessionListener;
-import com.android.server.wm.ActivityRecord;
-import com.android.server.wm.ActivityTaskManagerService;
-import com.android.server.wm.DisplayContent;
-import com.android.server.wm.IAppLockService;
-import com.android.server.wm.Task;
-import com.android.server.wm.WindowProcessController;
+import com.android.server.applock.AppLockController;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -198,9 +193,9 @@ public class AppLockService extends IAppLockManager.Stub implements IAppLockServ
         public void onChange(boolean selfChange) {
             ContentResolver resolver = mContext.getContentResolver();
             mLockBehavior = Settings.Secure.getIntForUser(resolver, SETTING_LOCK_BEHAVIOR,
-                    LOCK_BEHAVIOR_ON_LEAVE, -2);
+                    LOCK_BEHAVIOR_ON_LEAVE, UserHandle.USER_ALL);
             mLockTimeout = Settings.Secure.getIntForUser(resolver, SETTING_LOCK_TIMEOUT,
-                    AppLockManager.DEFAULT_LOCK_TIMEOUT, -2);
+                    AppLockManager.DEFAULT_LOCK_TIMEOUT, UserHandle.USER_ALL);
         }
     }
 

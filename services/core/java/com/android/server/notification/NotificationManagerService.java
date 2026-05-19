@@ -421,7 +421,7 @@ import com.android.server.utils.Slogf;
 import com.android.server.utils.quota.MultiRateLimiter;
 import com.android.server.wm.ActivityTaskManagerInternal;
 import com.android.server.wm.AxSandboxService;
-import com.android.server.applock.AppLockService;
+import com.android.server.wm.AppLockService;
 import com.android.server.wm.BackgroundActivityStartCallback;
 import com.android.server.wm.WindowManagerInternal;
 

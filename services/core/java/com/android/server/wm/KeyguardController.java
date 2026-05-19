@@ -16,7 +16,6 @@
 
 package com.android.server.wm;
 
-import com.android.server.applock.AppLockService;
 
 import static android.internal.perfetto.protos.Windowmanagerservice.KeyguardControllerProto.AOD_SHOWING;
 import static android.internal.perfetto.protos.Windowmanagerservice.KeyguardControllerProto.KEYGUARD_GOING_AWAY;

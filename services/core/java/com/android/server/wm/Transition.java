@@ -16,7 +16,6 @@
 
 package com.android.server.wm;
 
-import com.android.server.applock.AppLockService;
 
 import static android.app.ActivityOptions.ANIM_CUSTOM;
 import static android.app.ActivityOptions.ANIM_OPEN_CROSS_PROFILE_APPS;

@@ -16,7 +16,6 @@
 
 package com.android.server.wm;
 
-import com.android.server.applock.AppLockService;
 
 import static android.app.ActivityManager.isStartResultSuccessful;
 import static android.app.ActivityTaskManager.INVALID_TASK_ID;

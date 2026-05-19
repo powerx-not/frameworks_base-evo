@@ -16,7 +16,6 @@
 
 package com.android.server.wm;
 
-import com.android.server.applock.AppLockService;
 
 import static android.Manifest.permission.EMBED_ANY_APP_IN_UNTRUSTED_MODE;
 import static android.Manifest.permission.MANAGE_ACTIVITY_TASKS;
