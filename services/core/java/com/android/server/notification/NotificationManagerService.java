@@ -219,6 +219,7 @@ import android.app.AlarmManager;
 import android.app.AppGlobals;
 import android.app.AppOpsManager;
 import android.app.AxSandboxManager;
+import android.app.AppLockManager;
 import android.app.AutomaticZenRule;
 import android.app.IActivityManager;
 import android.app.IBinderSession;
@@ -420,6 +421,7 @@ import com.android.server.utils.Slogf;
 import com.android.server.utils.quota.MultiRateLimiter;
 import com.android.server.wm.ActivityTaskManagerInternal;
 import com.android.server.wm.AxSandboxService;
+import com.android.server.wm.AppLockService;
 import com.android.server.wm.BackgroundActivityStartCallback;
 import com.android.server.wm.WindowManagerInternal;
 
@@ -8919,6 +8921,11 @@ public class NotificationManagerService extends SystemService {
             notification.extras.putBoolean(AxSandboxManager.EXTRA_NOTIFICATION_APP_LOCKED, true);
         } else {
             notification.extras.remove(AxSandboxManager.EXTRA_NOTIFICATION_APP_LOCKED);
+        }
+        if (AppLockService.get().hasAppLock(pkg)) {
+            notification.extras.putBoolean(AppLockManager.EXTRA_NOTIFICATION_APP_LOCKED, true);
+        } else {
+            notification.extras.remove(AppLockManager.EXTRA_NOTIFICATION_APP_LOCKED);
         }
         r.setIsAppImportanceLocked(mPermissionHelper.isPermissionUserSet(pkg, userId));
         r.setPostSilently(postSilently);

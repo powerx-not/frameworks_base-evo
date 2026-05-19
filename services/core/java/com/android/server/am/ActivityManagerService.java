@@ -446,6 +446,7 @@ import com.android.internal.util.Preconditions;
 import com.android.internal.util.function.pooled.PooledLambda;
 import com.android.server.AlarmManagerInternal;
 import com.android.server.AxExtServiceFactory;
+import com.android.server.wm.AppLockService;
 import com.android.server.BootReceiver;
 import com.android.server.DeviceIdleInternal;
 import com.android.server.DisplayThread;
@@ -9300,6 +9301,7 @@ public class ActivityManagerService extends IActivityManager.Stub
                     mConstants.mComponentAliasOverrides);
             t.traceEnd(); // componentAlias
             
+            AppLockService.systemReady(mContext, mActivityTaskManager);
             AxExtServiceFactory.systemReady();
 
             t.traceEnd(); // PhaseActivityManagerReady

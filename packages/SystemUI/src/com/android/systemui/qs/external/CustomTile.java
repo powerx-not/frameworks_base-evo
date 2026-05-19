@@ -65,6 +65,7 @@ import com.android.systemui.qs.external.TileLifecycleManager.TileChangeListener;
 import com.android.systemui.qs.logging.QSLogger;
 import com.android.systemui.qs.tileimpl.QSTileImpl;
 import com.android.systemui.settings.DisplayTracker;
+import com.android.systemui.applock.AppLockHelper;
 import com.android.systemui.applocker.AxAppLockerHelper;
 
 import dagger.Lazy;
@@ -118,6 +119,7 @@ public class CustomTile extends QSTileImpl<State> implements TileChangeListener,
 
     private final IUriGrantsManager mIUriGrantsManager;
     private final AxAppLockerHelper mAxAppLockerHelper;
+    private final AppLockHelper mAppLockHelper;
 
     @AssistedInject
     CustomTile(
@@ -136,7 +138,8 @@ public class CustomTile extends QSTileImpl<State> implements TileChangeListener,
             TileServices tileServices,
             DisplayTracker displayTracker,
             IUriGrantsManager uriGrantsManager,
-            AxAppLockerHelper axAppLockerHelper
+            AxAppLockerHelper axAppLockerHelper,
+            AppLockHelper appLockHelper
     ) {
         super(host.get(), uiEventLogger, backgroundLooper, mainHandler, falsingManager,
                 metricsLogger, statusBarStateController, activityStarter, qsLogger);
@@ -154,6 +157,7 @@ public class CustomTile extends QSTileImpl<State> implements TileChangeListener,
         mDisplayTracker = displayTracker;
         mIUriGrantsManager = uriGrantsManager;
         mAxAppLockerHelper = axAppLockerHelper;
+        mAppLockHelper = appLockHelper;
     }
 
     @Override
@@ -419,8 +423,13 @@ public class CustomTile extends QSTileImpl<State> implements TileChangeListener,
             return;
         }
 
-        if (mAxAppLockerHelper.getState(mComponent.getPackageName()).needsAuth()) {
-            mAxAppLockerHelper.promptUnlock(mComponent.getPackageName(), mUser);
+        String pkg = mComponent.getPackageName();
+        if (mAppLockHelper.getState(pkg).needsAuth()) {
+            mAppLockHelper.promptUnlock(pkg, mUser);
+            return;
+        }
+        if (mAxAppLockerHelper.getState(pkg).needsAuth()) {
+            mAxAppLockerHelper.promptUnlock(pkg, mUser);
             return;
         }
 

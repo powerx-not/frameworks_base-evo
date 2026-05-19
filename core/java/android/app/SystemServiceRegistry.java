@@ -299,6 +299,7 @@ import android.webkit.WebViewBootstrapFrameworkInitializer;
 import com.android.internal.R;
 import com.android.internal.annotations.GuardedBy;
 import com.android.internal.app.IAppOpsService;
+import com.android.internal.app.IAppLockManager;
 import com.android.internal.app.IAxSandboxManager;
 import com.android.internal.app.IBatteryStats;
 import com.android.internal.app.ISoundTriggerService;
@@ -957,6 +958,18 @@ public final class SystemServiceRegistry {
                 IBinder b = ServiceManager.getServiceOrThrow(Context.APP_OPS_SERVICE);
                 IAppOpsService service = IAppOpsService.Stub.asInterface(b);
                 return new AppOpsManager(ctx, service);
+            }});
+
+        registerService(Context.APP_LOCK_SERVICE, AppLockManager.class,
+                new CachedServiceFetcher<AppLockManager>() {
+            @Override
+            public AppLockManager createService(ContextImpl ctx) {
+                IBinder b = ServiceManager.getService(Context.APP_LOCK_SERVICE);
+                if (b == null) {
+                    return null;
+                }
+                IAppLockManager service = IAppLockManager.Stub.asInterface(b);
+                return new AppLockManager(ctx.getOuterContext(), service);
             }});
 
         registerService(Context.AX_SANDBOX_SERVICE, AxSandboxManager.class,

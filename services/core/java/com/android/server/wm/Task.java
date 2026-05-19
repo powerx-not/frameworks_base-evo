@@ -16,6 +16,7 @@
 
 package com.android.server.wm;
 
+
 import static android.app.ActivityManager.isStartResultSuccessful;
 import static android.app.ActivityTaskManager.INVALID_TASK_ID;
 import static android.app.ActivityTaskManager.INVALID_WINDOWING_MODE;
@@ -2216,6 +2217,7 @@ class Task extends TaskFragment {
         if (prevWindowingMode != getWindowingMode()) {
             taskDisplayArea.onRootTaskWindowingModeChanged(this);
             AxSandboxService.get().onWindowingModeChanged(this, prevWindowingMode);
+            AppLockService.get().onWindowingModeChanged(this, prevWindowingMode);
         }
 
         if (!isOrganized() && !getRequestedOverrideBounds().isEmpty() && mDisplayContent != null) {

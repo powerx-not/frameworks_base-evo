@@ -16,6 +16,7 @@
 
 package com.android.server.wm;
 
+
 import static android.Manifest.permission.ACTIVITY_EMBEDDING;
 import static android.Manifest.permission.CAMERA;
 import static android.Manifest.permission.INTERNAL_SYSTEM_WINDOW;
@@ -1916,6 +1917,7 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
             mBalController.checkActivityAllowedToClearTask(
                             task, callingUid, callingPid, callerActivityClassName);
             AxSandboxService.get().removeTask(task, reason);
+            AppLockService.get().removeTask(task, reason);
             GameSpaceService.get().removeTask(task, reason);
         } finally {
             task.mInRemoveTask = false;
@@ -3016,7 +3018,9 @@ public class ActivityTaskSupervisor implements RecentTasks.Callbacks {
                 }
 
                 AxSandboxService.get().clearUnlockedApp();
+                AppLockService.get().clearUnlockedApp();
                 AxSandboxService.get().lockTopApp(task, "startActivityFromRecents");
+                AppLockService.get().lockTopApp(task, "startActivityFromRecents");
 
                 if (moveHomeTaskForward) {
                     // We always want to return to the home activity instead of the recents

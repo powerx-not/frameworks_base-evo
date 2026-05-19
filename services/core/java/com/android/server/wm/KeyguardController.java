@@ -16,6 +16,7 @@
 
 package com.android.server.wm;
 
+
 import static android.internal.perfetto.protos.Windowmanagerservice.KeyguardControllerProto.AOD_SHOWING;
 import static android.internal.perfetto.protos.Windowmanagerservice.KeyguardControllerProto.KEYGUARD_GOING_AWAY;
 import static android.internal.perfetto.protos.Windowmanagerservice.KeyguardControllerProto.KEYGUARD_PER_DISPLAY;
@@ -279,6 +280,7 @@ class KeyguardController {
 
         if (displayId == DEFAULT_DISPLAY && keyguardChanged) {
             AxSandboxService.get().setKeyguardDoneLocked(!keyguardShowing);
+            AppLockService.get().setKeyguardDoneLocked(!keyguardShowing);
         }
 
         // Update the sleep token first such that ensureActivitiesVisible has correct sleep token

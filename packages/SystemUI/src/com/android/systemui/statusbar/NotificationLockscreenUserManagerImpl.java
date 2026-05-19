@@ -34,6 +34,7 @@ import android.annotation.SuppressLint;
 import android.annotation.UserIdInt;
 import android.app.ActivityOptions;
 import android.app.AxSandboxManager;
+import android.app.AppLockManager;
 import android.app.KeyguardManager;
 import android.app.admin.DevicePolicyManager;
 import android.content.BroadcastReceiver;
@@ -101,6 +102,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import javax.inject.Inject;
+import com.android.systemui.applock.AppLockHelper;
 import com.android.systemui.applocker.AxAppLockerHelper;
 
 /**
@@ -320,6 +322,7 @@ public class NotificationLockscreenUserManagerImpl implements
 
     private final Lazy<DeviceUnlockedInteractor> mDeviceUnlockedInteractorLazy;
     private final AxAppLockerHelper mAxAppLockerHelper;
+    private final AppLockHelper mAppLockHelper;
 
     @Inject
     public NotificationLockscreenUserManagerImpl(Context context,
@@ -345,7 +348,8 @@ public class NotificationLockscreenUserManagerImpl implements
             Lazy<KeyguardInteractor> keyguardInteractor,
             Lazy<WifiRepository> wifiRepository,
             @Background CoroutineScope coroutineScope,
-            AxAppLockerHelper axAppLockerHelper
+            AxAppLockerHelper axAppLockerHelper,
+            AppLockHelper appLockHelper
     ) {
         mContext = context;
         mMainExecutor = mainExecutor;
@@ -368,7 +372,9 @@ public class NotificationLockscreenUserManagerImpl implements
         mFeatureFlags = featureFlags;
         mDeviceUnlockedInteractorLazy = deviceUnlockedInteractorLazy;
         mAxAppLockerHelper = axAppLockerHelper;
+        mAppLockHelper = appLockHelper;
         mAxAppLockerHelper.addRefreshListener(this::notifyNotificationStateChanged);
+        mAppLockHelper.addRefreshListener(this::notifyNotificationStateChanged);
 
         mLockScreenUris.add(SHOW_LOCKSCREEN);
         mLockScreenUris.add(SHOW_PRIVATE_LOCKSCREEN);
@@ -735,10 +741,14 @@ public class NotificationLockscreenUserManagerImpl implements
     public @RedactionType int getRedactionType(NotificationEntry ent) {
         int userId = ent.getSbn().getUserId();
 
-        if (ent.getSbn().getNotification().extras
-                        .getBoolean(AxSandboxManager.EXTRA_NOTIFICATION_APP_LOCKED, false)
-                && mAxAppLockerHelper.needsAuth(
-                        ent.getSbn().getPackageName(), ent.getSbn().getUserId())) {
+        android.os.Bundle extras = ent.getSbn().getNotification().extras;
+        boolean sandboxLocked = extras.getBoolean(
+                AxSandboxManager.EXTRA_NOTIFICATION_APP_LOCKED, false);
+        boolean appLockLocked = extras.getBoolean(
+                AppLockManager.EXTRA_NOTIFICATION_APP_LOCKED, false);
+        String pkg = ent.getSbn().getPackageName();
+        if ((appLockLocked && mAppLockHelper.needsAuth(pkg, userId))
+                || (sandboxLocked && mAxAppLockerHelper.needsAuth(pkg, userId))) {
             return REDACTION_TYPE_PUBLIC;
         }
 
