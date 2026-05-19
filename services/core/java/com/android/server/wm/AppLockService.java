@@ -227,6 +227,30 @@ public class AppLockService extends IAppLockManager.Stub implements IAppLockServ
     }
 
     @Override
+    public int getLockBehavior() {
+        return mLockBehavior;
+    }
+
+    @Override
+    public void setLockBehavior(int behavior) {
+        enforceSettingsManager();
+        putSecureIntSetting(SETTING_LOCK_BEHAVIOR, behavior);
+        mLockBehavior = behavior;
+    }
+
+    @Override
+    public int getLockTimeout() {
+        return mLockTimeout;
+    }
+
+    @Override
+    public void setLockTimeout(int timeoutSeconds) {
+        enforceSettingsManager();
+        putSecureIntSetting(SETTING_LOCK_TIMEOUT, timeoutSeconds);
+        mLockTimeout = timeoutSeconds;
+    }
+
+    @Override
     public int getAppLockState(String packageName) {
         return computeAppLockState(packageName).ordinal();
     }
@@ -880,5 +904,15 @@ public class AppLockService extends IAppLockManager.Stub implements IAppLockServ
             return;
         }
         throw new SecurityException("UID " + uid + " (" + pkg + ") cannot manage App Lock settings");
+    }
+
+    private void putSecureIntSetting(String key, int value) {
+        final long token = Binder.clearCallingIdentity();
+        try {
+            Settings.Secure.putIntForUser(mContext.getContentResolver(), key, value,
+                    UserHandle.USER_SYSTEM);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
     }
 }

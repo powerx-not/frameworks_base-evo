@@ -102,6 +102,42 @@ public class AppLockManager {
     }
 
     /** @hide */
+    public int getLockBehavior() {
+        try {
+            return mService.getLockBehavior();
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /** @hide */
+    public void setLockBehavior(int behavior) {
+        try {
+            mService.setLockBehavior(behavior);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /** @hide */
+    public int getLockTimeout() {
+        try {
+            return mService.getLockTimeout();
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /** @hide */
+    public void setLockTimeout(int timeoutSeconds) {
+        try {
+            mService.setLockTimeout(timeoutSeconds);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    /** @hide */
     public AppLockState getAppLockState(@NonNull String packageName) {
         try {
             return AppLockState.fromOrdinal(mService.getAppLockState(packageName));

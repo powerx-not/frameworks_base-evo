@@ -11,6 +11,11 @@ interface IAppLockManager {
     boolean isEnabled();
     void setEnabled(boolean enabled);
 
+    int getLockBehavior();
+    void setLockBehavior(int behavior);
+    int getLockTimeout();
+    void setLockTimeout(int timeoutSeconds);
+
     int getAppLockState(String packageName);
 
     void addLockedApp(String packageName);
