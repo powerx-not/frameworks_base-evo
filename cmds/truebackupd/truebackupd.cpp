@@ -432,6 +432,34 @@ static bool ChmodRecursive(const std::string& path, mode_t mode) {
     return ok;
 }
 
+/** User-visible backup root under /data/media/<user>/<folder> (not …/backup/… itself). */
+static std::string SharedStorageBackupRoot(const std::string& path) {
+    if (!android::base::StartsWith(path, "/data/media/")) return {};
+    const size_t backup = path.find("/backup");
+    if (backup != std::string::npos && backup > 0) {
+        return path.substr(0, backup);
+    }
+    const size_t apps = path.find("/apps");
+    if (apps != std::string::npos && apps > 0) {
+        return path.substr(0, apps);
+    }
+    return path;
+}
+
+/** media_rw uid/gid so file managers can list backups on emulated storage. */
+static void FixupSharedStorageBackupOwnership(const std::string& path) {
+    const std::string root = SharedStorageBackupRoot(path);
+    if (root.empty()) return;
+    constexpr uid_t kMediaRwUid = 1023;
+    constexpr gid_t kMediaRwGid = 1023;
+    if (!ChownRecursive(root, kMediaRwUid, kMediaRwGid)) {
+        PLOG(WARNING) << "ChownRecursive failed for " << root;
+    }
+    if (!ChmodRecursive(root, 0775)) {
+        PLOG(WARNING) << "ChmodRecursive failed for " << root;
+    }
+}
+
 static bool SetfileconRecursive(const std::string& path, const std::string& context) {
     struct stat st;
     if (lstat(path.c_str(), &st) != 0) {
@@ -620,7 +648,11 @@ class TrueBackupDaemonService : public android::BBinder {
             }
             case MKDIRS: {
                 std::string path = std::string(android::String8(data.readString16()).c_str());
-                bool ok = (path == kTrueBackupTmpDir) ? EnsureSystemWritableTempDir(path) : EnsureDir(path);
+                bool ok = (path == kTrueBackupTmpDir) ? EnsureSystemWritableTempDir(path)
+                                                        : EnsureDir(path);
+                if (ok && path != kTrueBackupTmpDir) {
+                    FixupSharedStorageBackupOwnership(path);
+                }
                 reply->writeInt32(ok ? 0 : -1);
                 return android::NO_ERROR;
             }
