@@ -218,6 +218,7 @@ public class AppLockService extends IAppLockManager.Stub implements IAppLockServ
 
     @Override
     public void setEnabled(boolean enabled) {
+        enforceSettingsManager();
         if (mController == null) return;
         mController.setEnabled(enabled);
         if (!enabled) {
@@ -236,6 +237,7 @@ public class AppLockService extends IAppLockManager.Stub implements IAppLockServ
 
     @Override
     public void addLockedApp(String packageName) {
+        enforceSettingsManager();
         if (mController == null) return;
         mController.addLockedApp(packageName);
         notifyAppLockStateChanged(packageName, true);
@@ -243,6 +245,7 @@ public class AppLockService extends IAppLockManager.Stub implements IAppLockServ
 
     @Override
     public void removeLockedApp(String packageName) {
+        enforceSettingsManager();
         if (mController == null) return;
         mController.removeLockedApp(packageName);
         int uid = getPackageUid(packageName);
@@ -865,5 +868,17 @@ public class AppLockService extends IAppLockManager.Stub implements IAppLockServ
         } catch (PackageManager.NameNotFoundException e) {
             return -1;
         }
+    }
+
+    private void enforceSettingsManager() {
+        final int uid = Binder.getCallingUid();
+        if (uid == Process.SYSTEM_UID || uid == Process.SHELL_UID) {
+            return;
+        }
+        final String pkg = mContext.getPackageManager().getNameForUid(uid);
+        if ("com.android.applock".equals(pkg)) {
+            return;
+        }
+        throw new SecurityException("UID " + uid + " (" + pkg + ") cannot manage App Lock settings");
     }
 }

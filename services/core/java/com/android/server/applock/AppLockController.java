@@ -13,6 +13,7 @@ import android.content.pm.LauncherApps;
 import android.content.pm.PackageManager;
 import android.database.ContentObserver;
 import android.net.Uri;
+import android.os.Binder;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.UserHandle;
@@ -122,8 +123,10 @@ public class AppLockController {
     }
 
     public void setEnabled(boolean enabled) {
-        Settings.Secure.putIntForUser(mContentResolver, AppLockManager.SETTING_ENABLED,
-                enabled ? 1 : 0, UserHandle.USER_SYSTEM);
+        runWithClearCallingIdentity(() -> {
+            Settings.Secure.putIntForUser(mContentResolver, AppLockManager.SETTING_ENABLED,
+                    enabled ? 1 : 0, UserHandle.USER_SYSTEM);
+        });
         mEnabled = enabled;
     }
 
@@ -242,9 +245,21 @@ public class AppLockController {
             synchronized (this) {
                 config.put(KEY_LOCKED_PKGS, new JSONArray(mLockedPackages));
             }
-            Settings.Secure.putString(mContentResolver, AppLockManager.SETTING_CONFIG, config.toString());
+            final String json = config.toString();
+            runWithClearCallingIdentity(() ->
+                    Settings.Secure.putString(mContentResolver, AppLockManager.SETTING_CONFIG,
+                            json));
         } catch (JSONException e) {
             Slog.e(TAG, "Failed to save applock_config JSON", e);
+        }
+    }
+
+    private static void runWithClearCallingIdentity(Runnable action) {
+        final long token = Binder.clearCallingIdentity();
+        try {
+            action.run();
+        } finally {
+            Binder.restoreCallingIdentity(token);
         }
     }
 
