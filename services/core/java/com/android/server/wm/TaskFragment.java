@@ -16,6 +16,8 @@
 
 package com.android.server.wm;
 
+import com.android.server.applock.AppLockService;
+
 import static android.Manifest.permission.EMBED_ANY_APP_IN_UNTRUSTED_MODE;
 import static android.Manifest.permission.MANAGE_ACTIVITY_TASKS;
 import static android.app.ActivityManager.LOCK_TASK_MODE_LOCKED;
@@ -705,7 +707,8 @@ class TaskFragment extends WindowContainer<WindowContainer> {
             getTask().touchActiveTime();
         }
 
-        if (AxSandboxService.get().checkLockApp(mResumedActivity, r)) {
+        if (AxSandboxService.get().checkLockApp(mResumedActivity, r)
+                || AppLockService.get().checkLockApp(mResumedActivity, r)) {
             return;
         }
 
@@ -1870,7 +1873,8 @@ class TaskFragment extends WindowContainer<WindowContainer> {
             mTaskSupervisor.startSpecificActivity(next, true, true);
         }
 
-        if (AxSandboxService.get().checkLockApp(prev, next)) {
+        if (AxSandboxService.get().checkLockApp(prev, next)
+                || AppLockService.get().checkLockApp(prev, next)) {
             return true;
         }
 

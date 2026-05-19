@@ -6265,6 +6265,14 @@ public abstract class Context {
     public static final String AX_SANDBOX_SERVICE = "ax_sandbox";
 
     /**
+     * Use with {@link #getSystemService(String)} to retrieve an {@link android.app.AppLockManager}
+     * for system-level app lock.
+     *
+     * @hide
+     */
+    public static final String APP_LOCK_SERVICE = "applock";
+
+    /**
      * Use with {@link #getSystemService(String)} to retrieve a {@link android.app.role.RoleManager}
      * for managing roles.
      *

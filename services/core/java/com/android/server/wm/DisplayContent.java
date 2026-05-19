@@ -16,6 +16,8 @@
 
 package com.android.server.wm;
 
+import com.android.server.applock.AppLockService;
+
 import static android.app.ActivityTaskManager.INVALID_TASK_ID;
 import static android.app.WindowConfiguration.ACTIVITY_TYPE_DREAM;
 import static android.app.WindowConfiguration.ACTIVITY_TYPE_HOME;
@@ -4156,6 +4158,7 @@ class DisplayContent extends RootDisplayArea implements WindowManagerPolicy.Disp
 
         if (mDisplayId == DEFAULT_DISPLAY && newFocus != null) {
             AxSandboxService.get().onAppFocusChanged(newFocus, newTask);
+            AppLockService.get().onAppFocusChanged(newFocus, newTask);
             GameSpaceService.get().onAppFocusChanged(newFocus, newTask);
         }
 

@@ -41,6 +41,7 @@ import com.android.internal.logging.MetricsLogger;
 import com.android.internal.logging.UiEventLogger;
 import com.android.internal.statusbar.IStatusBarService;
 import com.android.systemui.Flags;
+import com.android.systemui.applock.AppLockHelper;
 import com.android.systemui.applocker.AxAppLockerHelper;
 import com.android.systemui.flags.FeatureFlagsClassic;
 import com.android.systemui.plugins.FalsingManager;
@@ -133,6 +134,7 @@ public class ExpandableNotificationRowController implements NotifViewController 
     private final WindowRootViewBlurInteractor mWindowRootViewBlurInteractor;
     private final NotificationActivityStarter mNotificationActivityStarter;
     private final AxAppLockerHelper mAxAppLockerHelper;
+    private final AppLockHelper mAppLockHelper;
     private final Context mContext;
 
     @VisibleForTesting
@@ -302,7 +304,8 @@ public class ExpandableNotificationRowController implements NotifViewController 
             WindowRootViewBlurInteractor windowRootViewBlurInteractor,
             BundleInteractionLogger bundleInteractionLogger,
             NotificationActivityStarter notificationActivityStarter,
-            AxAppLockerHelper axAppLockerHelper) {
+            AxAppLockerHelper axAppLockerHelper,
+            AppLockHelper appLockHelper) {
         mView = view;
         mContext = context;
         mListContainer = listContainer;
@@ -343,6 +346,7 @@ public class ExpandableNotificationRowController implements NotifViewController 
         mBundleInteractionLogger = bundleInteractionLogger;
         mNotificationActivityStarter = notificationActivityStarter;
         mAxAppLockerHelper = axAppLockerHelper;
+        mAppLockHelper = appLockHelper;
     }
 
     String loadsGutsAppName(Context context, PipelineEntry pipelineEntry) {
@@ -410,7 +414,8 @@ public class ExpandableNotificationRowController implements NotifViewController 
                 mNotificationRebindingTracker,
                 mBundleInteractionLogger,
                 mNotificationActivityStarter,
-                mAxAppLockerHelper
+                mAxAppLockerHelper,
+                mAppLockHelper
         );
         mView.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
         if (mAllowLongPress) {

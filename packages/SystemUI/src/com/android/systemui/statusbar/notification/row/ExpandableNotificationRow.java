@@ -35,6 +35,7 @@ import android.animation.AnimatorListenerAdapter;
 import android.animation.ObjectAnimator;
 import android.animation.ValueAnimator.AnimatorUpdateListener;
 import android.app.AxSandboxManager;
+import android.app.AppLockManager;
 import android.app.Notification;
 import android.content.Context;
 import android.content.res.Configuration;
@@ -157,6 +158,7 @@ import com.android.systemui.util.DumpUtilsKt;
 import com.android.systemui.util.ListenerSet;
 import com.android.wm.shell.shared.animation.PhysicsAnimator;
 
+import com.android.systemui.applock.AppLockHelper;
 import com.android.systemui.applocker.AxAppLockerHelper;
 
 import java.io.PrintWriter;
@@ -219,6 +221,7 @@ public class ExpandableNotificationRow extends ActivatableNotificationView
     private PeopleNotificationIdentifier mPeopleNotificationIdentifier;
     private NotificationActivityStarter mNotificationActivityStarter;
     private AxAppLockerHelper mAxAppLockerHelper;
+    private AppLockHelper mAppLockHelper;
     private MetricsLogger mMetricsLogger;
     private NotificationChildrenContainerLogger mChildrenContainerLogger;
     private ColorUpdateLogger mColorUpdateLogger;
@@ -488,23 +491,33 @@ public class ExpandableNotificationRow extends ActivatableNotificationView
     private boolean isNotificationAppLocked() {
         StatusBarNotification sbn = getAppLockSbn();
         if (sbn == null) return false;
-        if (!sbn.getNotification().extras
-                .getBoolean(AxSandboxManager.EXTRA_NOTIFICATION_APP_LOCKED, false)) {
-            return false;
-        }
-        return mAxAppLockerHelper.needsAuth(sbn.getPackageName(), sbn.getUserId());
+        android.os.Bundle extras = sbn.getNotification().extras;
+        boolean sandboxLocked = extras.getBoolean(
+                AxSandboxManager.EXTRA_NOTIFICATION_APP_LOCKED, false);
+        boolean appLockLocked = extras.getBoolean(
+                AppLockManager.EXTRA_NOTIFICATION_APP_LOCKED, false);
+        if (!sandboxLocked && !appLockLocked) return false;
+        String pkg = sbn.getPackageName();
+        int userId = sbn.getUserId();
+        if (appLockLocked && mAppLockHelper.needsAuth(pkg, userId)) return true;
+        return sandboxLocked && mAxAppLockerHelper.needsAuth(pkg, userId);
     }
 
     private boolean doesNotificationNeedAuth() {
-        StatusBarNotification sbn = getAppLockSbn();
-        if (sbn == null) return false;
-        return mAxAppLockerHelper.needsAuth(sbn.getPackageName(), sbn.getUserId());
+        return isNotificationAppLocked();
     }
 
     private void promptAppUnlock() {
         StatusBarNotification sbn = getAppLockSbn();
         if (sbn == null) return;
-        mAxAppLockerHelper.promptUnlock(sbn.getPackageName(), sbn.getUserId());
+        android.os.Bundle extras = sbn.getNotification().extras;
+        String pkg = sbn.getPackageName();
+        int userId = sbn.getUserId();
+        if (extras.getBoolean(AppLockManager.EXTRA_NOTIFICATION_APP_LOCKED, false)) {
+            mAppLockHelper.promptUnlock(pkg, userId);
+        } else {
+            mAxAppLockerHelper.promptUnlock(pkg, userId);
+        }
     }
 
     private boolean mKeepInParentForDismissAnimation;
@@ -2314,7 +2327,8 @@ public class ExpandableNotificationRow extends ActivatableNotificationView
             NotificationRebindingTracker notificationRebindingTracker,
             BundleInteractionLogger bundleInteractionLogger,
             NotificationActivityStarter notificationActivityStarter,
-            AxAppLockerHelper axAppLockerHelper) {
+            AxAppLockerHelper axAppLockerHelper,
+            AppLockHelper appLockHelper) {
 
         if (NotificationBundleUi.isEnabled()) {
             mEntryAdapter = entryAdapter;
@@ -2331,6 +2345,7 @@ public class ExpandableNotificationRow extends ActivatableNotificationView
         mRebindingTracker = notificationRebindingTracker;
         mNotificationActivityStarter = notificationActivityStarter;
         mAxAppLockerHelper = axAppLockerHelper;
+        mAppLockHelper = appLockHelper;
         if (mMenuRow == null) {
             mMenuRow = new NotificationMenuRow(
                     mContext, peopleNotificationIdentifier, mNotificationActivityStarter);

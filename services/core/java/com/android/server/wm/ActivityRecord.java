@@ -16,6 +16,8 @@
 
 package com.android.server.wm;
 
+import com.android.server.applock.AppLockService;
+
 import static android.app.ActivityManager.LOCK_TASK_MODE_NONE;
 import static android.app.ActivityManager.PROCESS_STATE_IMPORTANT_FOREGROUND;
 import static android.app.ActivityOptions.ANIM_CLIP_REVEAL;
@@ -2411,8 +2413,10 @@ final class ActivityRecord extends WindowToken {
     private int getStartingWindowType(boolean newTask, boolean taskSwitch, boolean processRunning,
             boolean allowTaskSnapshot, boolean activityCreated, boolean activityAllDrawn,
             TaskSnapshot snapshot) {
-        boolean isAppLockerActivity = AxSandboxService.get().isAppLockerActivity(this.intent.getComponent());
-        if (AxSandboxService.get().isAppLocked(this) || isAppLockerActivity) {
+        boolean isAppLockerActivity = AxSandboxService.get().isAppLockerActivity(this.intent.getComponent())
+                || AppLockService.get().isAuthActivity(this.intent.getComponent());
+        if (AxSandboxService.get().isAppLocked(this) || AppLockService.get().isAppLocked(this)
+                || isAppLockerActivity) {
             return (isAppLockerActivity || processRunning) ? STARTING_WINDOW_TYPE_NONE : STARTING_WINDOW_TYPE_SPLASH_SCREEN;
         }
         // A special case that a new activity is launching to an existing task which is moving to
@@ -3495,7 +3499,8 @@ final class ActivityRecord extends WindowToken {
      */
     private void finishActivityResults(int resultCode, Intent resultData,
             NeededUriGrants resultGrants) {
-        if (AxSandboxService.get().checkUnlockApp(this, resultCode, resultData)) {
+        if (AxSandboxService.get().checkUnlockApp(this, resultCode, resultData)
+                || AppLockService.get().checkUnlockApp(this, resultCode, resultData)) {
             resultTo = null;
         }
         // Send the result if needed
@@ -4289,6 +4294,7 @@ final class ActivityRecord extends WindowToken {
      */
     void handleAppDied() {
         AxSandboxService.get().onAppDied(packageName, mUserId);
+        AppLockService.get().onAppDied(packageName, mUserId);
         final boolean remove;
         if (Process.isSdkSandboxUid(getUid())) {
             // Sandbox activities are created for SDKs run in the sandbox process, when the sandbox
@@ -4654,7 +4660,8 @@ final class ActivityRecord extends WindowToken {
             }
             return true;
         } else if (fromActivity.mStartingData != null) {
-            if (AxSandboxService.get().isAppLockerActivity(this.intent.getComponent())) {
+            if (AxSandboxService.get().isAppLockerActivity(this.intent.getComponent())
+                    || AppLockService.get().isAuthActivity(this.intent.getComponent())) {
                 return false;
             }
             if (fromActivity.mStartingData instanceof SnapshotStartingData
@@ -6373,7 +6380,7 @@ final class ActivityRecord extends WindowToken {
             throw new IllegalStateException("Request to stop a finishing activity: " + this);
         }
         if (isNoHistory()) {
-            if (AxSandboxService.get().isAppLocked(this)) {
+            if (AxSandboxService.get().isAppLocked(this) || AppLockService.get().isAppLocked(this)) {
                 Slog.d(TAG_STATES, "AppLocker: Skip no-history finish for locked app " + this);
             } else if (!task.shouldSleepActivities()) {
                 ProtoLog.d(WM_DEBUG_STATES, "no-history finish of %s", this);
@@ -9016,8 +9023,9 @@ final class ActivityRecord extends WindowToken {
             }
         }
 
-        if (AxSandboxService.get().isAppLocked(this)
-            || AxSandboxService.get().isAppLockerActivity(this.intent.getComponent())) {
+        if (AxSandboxService.get().isAppLocked(this) || AppLockService.get().isAppLocked(this)
+            || AxSandboxService.get().isAppLockerActivity(this.intent.getComponent())
+            || AppLockService.get().isAuthActivity(this.intent.getComponent())) {
             return false;
         }
 

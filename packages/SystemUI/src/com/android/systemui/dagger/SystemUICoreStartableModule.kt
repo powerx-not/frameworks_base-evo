@@ -21,6 +21,7 @@ import com.android.systemui.CoreStartable
 import com.android.systemui.LatencyTester
 import com.android.systemui.SliceBroadcastRelayHandler
 import com.android.systemui.accessibility.Magnification
+import com.android.systemui.applock.AppLockHelper
 import com.android.systemui.applocker.AxAppLockerHelper
 import com.android.systemui.ax.AxPlatformServiceImpl
 import com.android.systemui.axdynamicbar.domain.AxDynamicBarChipsRefiner
@@ -368,4 +369,9 @@ abstract class SystemUICoreStartableModule {
     @IntoMap
     @ClassKey(AxAppLockerHelper::class)
     abstract fun bindAxAppLockerHelper(impl: AxAppLockerHelper): CoreStartable
+
+    @Binds
+    @IntoMap
+    @ClassKey(AppLockHelper::class)
+    abstract fun bindAppLockHelper(impl: AppLockHelper): CoreStartable
 }
