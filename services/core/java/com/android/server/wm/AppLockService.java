@@ -58,11 +58,11 @@ import java.util.concurrent.ConcurrentHashMap;
 public class AppLockService extends IAppLockManager.Stub implements IAppLockService {
     private static final String TAG = "AppLockService";
 
-    /** System auth overlay (PIN/pattern/biometric). */
-    private static final String AUTH_PACKAGE = "com.android.applocker";
-    private static final String AUTH_ACTIVITY = "com.android.applocker.AuthenticateActivity";
-    /** Intent action understood by {@link #AUTH_PACKAGE} auth overlay. */
-    private static final String ACTION_AUTH_UNLOCK = "com.android.applocker.action.SYSTEM_UNLOCK";
+    /** System auth overlay (PIN/pattern/biometric) in {@code com.android.applock}. */
+    private static final String AUTH_PACKAGE = "com.android.applock";
+    private static final String AUTH_ACTIVITY = "com.android.applock.auth.AuthenticateActivity";
+    /** Intent action understood by the App Lock auth overlay. */
+    private static final String ACTION_AUTH_UNLOCK = "com.android.applock.action.SYSTEM_UNLOCK";
 
     private static final String EXTRA_LOCKED_UID = AppLockManager.EXTRA_LOCKED_UID;
     private static final String EXTRA_LOCKED_PACKAGE = AppLockManager.EXTRA_LOCKED_PACKAGE;
@@ -81,7 +81,6 @@ public class AppLockService extends IAppLockManager.Stub implements IAppLockServ
     private static final Set<String> PROTECTED_PACKAGES = Set.of(
             "android",
             AUTH_PACKAGE,
-            "com.android.applock",
             "com.android.settings"
     );
 
